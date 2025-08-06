@@ -1,0 +1,5 @@
+praw
+transformers
+fastapi
+uvicorn
+python-dotenv
