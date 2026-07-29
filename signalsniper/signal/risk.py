@@ -55,6 +55,61 @@ class RiskConfig:
     min_shares: int = 1
     min_notional: float = 200.0
 
+    def viability(self, typical_price: float = 100.0) -> list[str]:
+        """Can an account this size actually place a trade at all?
+
+        Worth checking explicitly because the failure is silent otherwise: the
+        sizing path just returns None with `size_zero` on every signal, which
+        looks identical to "no opportunities today". An account that structurally
+        cannot trade should say so at startup, not look quiet.
+        """
+        out: list[str] = []
+        max_pos = self.equity * self.max_position_frac
+        if max_pos < self.min_notional:
+            out.append(
+                f"max position ${max_pos:,.0f} ({self.max_position_frac:.0%} of "
+                f"${self.equity:,.0f}) is below the ${self.min_notional:,.0f} "
+                "minimum notional -- EVERY order will be rejected before it is sent"
+            )
+        risk_budget = self.equity * self.risk_per_trade
+        if risk_budget < 5.0:
+            out.append(
+                f"risk budget is ${risk_budget:.2f} per trade -- at a typical "
+                f"{self.min_stop_bps:.0f}bps minimum stop that sizes to well "
+                "under one share on most names"
+            )
+        if self.equity < typical_price:
+            out.append(
+                f"${self.equity:,.0f} equity cannot buy a single share of a "
+                f"${typical_price:,.0f} stock"
+            )
+        if self.equity < 2_000:
+            out.append(
+                f"${self.equity:,.0f} is below the $2,000 Reg T margin minimum -- "
+                "this is a CASH account, so SHORT SELLING IS IMPOSSIBLE and "
+                "sale proceeds must settle before reuse"
+            )
+        return out
+
+    @classmethod
+    def for_equity(cls, equity: float, **overrides) -> "RiskConfig":
+        """Scale the guards to the account rather than leaving them nonsensical.
+
+        The defaults assume a five-figure account. Applied to $200 they produce a
+        config that cannot trade. This keeps the *proportions* sane at any size
+        while leaving the hard safety limits alone.
+        """
+        cfg = cls(equity=equity, **overrides)
+        if equity < 5_000:
+            # One position at a time, most of the account, and a notional floor
+            # low enough that an order can exist at all.
+            cfg.max_position_frac = min(0.90, cfg.max_position_frac * 4)
+            cfg.max_concurrent = 1
+            cfg.min_notional = min(cfg.min_notional, equity * 0.25)
+            # The loss cap stays a percentage, so it scales down with the account
+            # automatically -- do not widen it to make the numbers look better.
+        return cfg
+
 
 @dataclass(slots=True)
 class Position:

@@ -64,13 +64,17 @@ class Runner:
             max_concurrent=cfg.max_concurrent,
         ))
         self.enricher: EdgarEnricher | None = None
+        #: Set when a live quote source supports mid-stream subscription. Lets
+        #: the broad EDGAR path signal on names outside the initial watchlist.
+        self.quote_source = None
         self.on_signal = on_signal or self._default_signal_sink
         self.on_order = on_order or self._default_order_sink
         self.stop = asyncio.Event()
         self.feeds: list = []
         self._watch = {t.upper() for t in cfg.watchlist}
         self.counts = {"docs": 0, "events": 0, "signals": 0, "orders": 0,
-                       "accepted": 0, "rejected": 0, "unfilled": 0}
+                       "accepted": 0, "rejected": 0, "unfilled": 0,
+                       "subscribed": 0}
 
         # Subscribe eagerly at construction, not inside the loop coroutines. A
         # task does not run until the scheduler gets to it, so subscribing there
@@ -147,6 +151,26 @@ class Runner:
             event = build_event(doc, tickers)
             if event.materiality <= 0.0 and not tickers:
                 continue
+
+            # The EDGAR path watches every US filer, but the engine needs a tape
+            # on a name to size or even gate a trade. Subscribe on demand so a
+            # material filing on an unwatched small cap is actionable rather
+            # than discarded as "illiquid" purely for want of data.
+            if (self.quote_source is not None and tickers
+                    and event.materiality >= self.engine.cfg.min_materiality):
+                missing = [t for t in tickers if t not in self.market.tapes]
+                if missing:
+                    try:
+                        added = await self.quote_source.add_symbols(missing)
+                        if added:
+                            self.counts["subscribed"] += len(added)
+                            # The tape needs ticks before the engine can act, so
+                            # this filing may not fire -- the next event on the
+                            # name will. That is the cost of not knowing the
+                            # universe in advance.
+                            log.info("subscribed on demand: %s", ",".join(added))
+                    except Exception as exc:
+                        log.warning("on-demand subscribe failed: %r", exc)
             self.counts["events"] += 1
             self.bus.publish(TOPIC_EVENT, event)
 
@@ -361,6 +385,7 @@ class Runner:
         for feed in self.feeds:
             tasks.append(asyncio.create_task(feed.run(self.stop), name=feed.name))
         if quote_source is not None:
+            self.quote_source = quote_source if hasattr(quote_source, "add_symbols") else None
             tasks.append(asyncio.create_task(self._quote_loop(quote_source), name="quotes"))
         tasks.append(asyncio.create_task(self._heartbeat(), name="heartbeat"))
 

@@ -53,6 +53,7 @@ class AlpacaQuoteStream:
         symbols: Iterable[str],
         feed: str = "iex",
         url: str | None = None,
+        max_symbols: int = 200,
     ) -> None:
         self.key = key
         self.secret = secret
@@ -61,6 +62,46 @@ class AlpacaQuoteStream:
         self.url = url or f"wss://stream.data.alpaca.markets/v2/{feed}"
         self.connected = False
         self.messages = 0
+        self.max_symbols = max_symbols
+        self._ws = None
+        self._pending: list[str] = []
+
+    async def add_symbols(self, symbols: Iterable[str]) -> list[str]:
+        """Subscribe to more symbols on a live socket.
+
+        This is what makes the EDGAR long-tail path actually tradeable. That path
+        ingests filings from *every* US issuer, but the engine needs a tape on a
+        name to check liquidity and get a reference price -- so without dynamic
+        subscription it can only ever signal on the pre-configured watchlist,
+        which defeats the point of watching the whole market.
+
+        Returns the symbols newly added.
+        """
+        fresh = [s.upper() for s in symbols
+                 if s and s.upper() not in self.symbols]
+        if not fresh:
+            return []
+        room = self.max_symbols - len(self.symbols)
+        if room <= 0:
+            log.warning("symbol cap %d reached; not subscribing %s",
+                        self.max_symbols, ",".join(fresh))
+            return []
+        fresh = fresh[:room]
+        self.symbols.extend(fresh)
+
+        if self._ws is None:
+            # Not connected yet -- they are in self.symbols and will go out with
+            # the initial subscribe.
+            return fresh
+        try:
+            await self._ws.send(json.dumps({
+                "action": "subscribe", "quotes": fresh, "trades": fresh,
+            }))
+            log.info("subscribed mid-stream to %s", ",".join(fresh))
+        except Exception as exc:
+            log.warning("mid-stream subscribe failed for %s: %r", fresh, exc)
+            self._pending.extend(fresh)
+        return fresh
 
     async def stream(self) -> AsyncIterator[Quote]:
         try:
@@ -72,15 +113,22 @@ class AlpacaQuoteStream:
         while True:
             try:
                 async with websockets.connect(self.url, ping_interval=10, max_queue=4096) as ws:
+                    self._ws = ws
                     await ws.send(json.dumps(
                         {"action": "auth", "key": self.key, "secret": self.secret}
                     ))
                     await ws.recv()  # auth ack
+                    # Re-subscribe the FULL current set on every (re)connect,
+                    # including anything added mid-stream. A reconnect that
+                    # restored only the original watchlist would silently drop
+                    # the dynamically-added names -- and those are exactly the
+                    # ones with a live position or a pending signal.
                     await ws.send(json.dumps({
                         "action": "subscribe",
                         "quotes": self.symbols,
                         "trades": self.symbols,
                     }))
+                    self._pending.clear()
                     self.connected = True
                     backoff = 0.5
                     log.info("alpaca stream up: %d symbols on %s", len(self.symbols), self.feed)
@@ -92,6 +140,7 @@ class AlpacaQuoteStream:
                 raise
             except Exception as exc:
                 self.connected = False
+                self._ws = None
                 log.warning("alpaca stream dropped: %r; reconnecting in %.1fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(15.0, backoff * 2)

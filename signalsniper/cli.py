@@ -307,6 +307,25 @@ async def cmd_preflight(args) -> int:
             print(f"  [!] {b}")
         rc = 1
 
+    from .signal.risk import RiskConfig
+    rc = RiskConfig(equity=cfg.equity, risk_per_trade=cfg.risk_per_trade,
+                    max_daily_loss_frac=cfg.max_daily_loss,
+                    max_concurrent=cfg.max_concurrent)
+    viability = rc.viability()
+    if viability:
+        print("\n== account viability ==")
+        for v in viability:
+            print(f"  [!] {v}")
+        print("\n  A structurally untradeable account looks IDENTICAL to a quiet")
+        print("  market from the outside -- every signal is silently dropped with")
+        print("  'size_zero'. Fix the sizing or run alert-only/paper.")
+        rc2 = RiskConfig.for_equity(cfg.equity)
+        if not rc2.viability():
+            print(f"\n  RiskConfig.for_equity(${cfg.equity:,.0f}) would work:")
+            print(f"    max_position_frac {rc2.max_position_frac:.0%}, "
+                  f"max_concurrent {rc2.max_concurrent}, "
+                  f"min_notional ${rc2.min_notional:,.0f}")
+        rc = -1  # mark
     if abs(acct.equity - cfg.equity) > max(100.0, acct.equity * 0.05):
         print(f"\n  [!] EQUITY env is ${cfg.equity:,.0f} but the account holds "
               f"${acct.equity:,.0f}.")
@@ -314,6 +333,8 @@ async def cmd_preflight(args) -> int:
         rc = 1
 
     await broker.aclose()
+    if viability:
+        rc = 1
 
     print("\n== execution posture ==")
     print(f"  LIVE_TRADING   : {cfg.live}")
