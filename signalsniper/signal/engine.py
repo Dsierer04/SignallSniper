@@ -84,8 +84,19 @@ class EngineConfig:
 
 #: Mega caps do not move 18% on an 8-K. Damp the expected-move prior for names
 #: where the float is enormous and the coverage is total.
+#:
+#: These are calibrated against the OPTIONS-IMPLIED move into the print, which is
+#: the market's own estimate of event magnitude and a far better anchor than a
+#: guess. For 2026-07-30 the options market prices **AMZN at roughly 1.7x AAPL's
+#: expected move**. The earlier table had AMZN at only 1.2x AAPL, which would
+#: have taken materially more risk on AMZN than intended -- a uniform notional
+#: cap across two names with different expected moves is not uniform risk.
+#:
+#: Re-derive these from the implied move before any event you actually trade;
+#: they are event-specific, not permanent properties of the ticker.
 DEFAULT_MOVE_SCALE: dict[str, float] = {
-    "AAPL": 0.25, "MSFT": 0.25, "AMZN": 0.30, "GOOGL": 0.30, "META": 0.35,
+    "AAPL": 0.25, "AMZN": 0.42,   # 0.42/0.25 = 1.68x, matching implied
+    "MSFT": 0.25, "GOOGL": 0.30, "META": 0.35,
     "NVDA": 0.40, "AVGO": 0.40, "TSLA": 0.50, "JPM": 0.25, "XOM": 0.25,
     "SPY": 0.15, "QQQ": 0.18, "IWM": 0.20, "TLT": 0.15,
 }

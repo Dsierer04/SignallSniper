@@ -117,6 +117,28 @@ opposite direction. Now polls order status and corrects.
 
 ---
 
+## 4b. Calendar and sizing corrections
+
+- **The FOMC decision has not happened.** It lands 14:00 ET *today* (Jul 29),
+  Warsh's first meeting as Chair, with a genuine hike tail (6.6–27% across
+  prediction markets in July). My runbook treated it as settled history. A
+  hawkish surprise today reprices the whole Jul 30 tape.
+- **The releases are staggered, not simultaneous.** AMZN ~16:00–16:05, AAPL
+  16:30. That is *better* than I assumed — the PR cascades are sequential with
+  ~30 minutes between them. What actually collides is the two 17:00 calls
+  (verify AMZN's, it may be 17:30, which would remove the overlap entirely).
+- **The 08:30 block is four-way, not three:** GDP + PCE + claims + ECI. Growth
+  and inflation surprises land in the same tick, so single-indicator attribution
+  misfires by construction.
+- **AMZN's options-implied move is ~1.7x AAPL's.** `DEFAULT_MOVE_SCALE` had it
+  at 1.2x, so a uniform notional cap would have taken materially more risk on
+  AMZN than intended. Now 1.68x.
+- Consensus, confirmed: AAPL revenue ~$108.8B / EPS ~$1.88; AMZN revenue ~$196B
+  / EPS $1.82; AWS ~$40.5B at ~32% YoY (accelerating from 28%).
+- MSFT / META / ARM report tonight, so Jul 30 opens on an overnight gap.
+
+---
+
 ## 5. What survives
 
 Not nothing:
