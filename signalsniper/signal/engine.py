@@ -65,12 +65,19 @@ class EngineConfig:
     ttl_s: float = 300.0
     #: Per-ticker damping. Mega caps move less on the same news.
     move_scale: dict[str, float] | None = None
-    #: Only propagate through links whose lag has been measured against history
-    #: by tools/validate.py and found tradeable. Off by default because the
-    #: shipped graph is entirely unverified -- turning it on with no measurements
-    #: silences the system completely, which is the correct behaviour but a
-    #: confusing default.
-    verified_links_only: bool = False
+    #: Only propagate through links whose lag has been MEASURED against history
+    #: by tools/validate.py and found tradeable.
+    #:
+    #: Defaults to True, and on the shipped graph -- where nothing is measured --
+    #: that means the second-order path emits NOTHING. That silence is the point.
+    #: The literature review refuted the minutes-scale propagation thesis this
+    #: path depends on (see docs/VERIFICATION.md), so trading an unmeasured link
+    #: is acting on a claim the evidence contradicts. Run the validation, and
+    #: links that clear the bar start firing on their own.
+    #:
+    #: Set False to trade unverified links anyway -- an explicit choice to act
+    #: without evidence, not a default you back into.
+    verified_links_only: bool = True
     #: Confidence multiplier applied to links that have never been checked
     #: against the tape. An unchecked economic story is not worth the same as a
     #: measured one.

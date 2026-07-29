@@ -160,6 +160,29 @@ Not nothing:
 
 ---
 
+## 5b. The default changed
+
+`verified_links_only` now defaults to **True**. On the shipped graph nothing is
+measured, so **the second-order path emits nothing**:
+
+```
+$ python3 -m signalsniper demo
+== linkage coverage ==
+  0/24 links measured against history, 0 clear the lag bar
+
+== signals on the real defaults (0) ==
+  none -- no link has been measured, so nothing propagates.
+  Run: python3 tools/validate.py --primary AAPL --feed sip
+```
+
+That silence is the deliverable. Trading an unmeasured link means acting on a
+claim the evidence contradicts, and a default that does it quietly is worse than
+one that refuses. `--unverified` shows what it *would* emit, clearly labelled as
+acting without evidence. Links that clear the lag bar start firing on their own
+once `validate.py --emit` writes the measurements.
+
+---
+
 ## 6. My recommendation for tomorrow
 
 **Do not put real money on the second-order trade tomorrow.** Not because of

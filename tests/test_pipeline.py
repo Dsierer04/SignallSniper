@@ -141,6 +141,8 @@ class TestFullPipeline:
             "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
         })
         runner = Runner(cfg, resolver=resolver)
+        # Testing pipeline mechanics, not the gating policy.
+        runner.engine.cfg.verified_links_only = False
 
         # Prime both tapes, then move AAPL hard and leave CRUS behind.
         t_pre = now_ns() - 8_000_000_000

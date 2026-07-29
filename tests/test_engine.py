@@ -13,6 +13,14 @@ from signalsniper.signal.engine import DEFAULT_MOVE_SCALE, EngineConfig, SignalE
 
 
 def make_engine(market, **cfg_kw):
+    """Engine for testing propagation MECHANICS.
+
+    verified_links_only defaults to True in production so an unmeasured graph
+    emits nothing. These tests are about the arithmetic of propagation, not the
+    gating policy, so they opt out explicitly. TestVerificationGating covers the
+    policy itself, including that the real default is silent.
+    """
+    cfg_kw.setdefault("verified_links_only", False)
     cfg = EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE), **cfg_kw)
     return SignalEngine(market, LinkageGraph(), cfg)
 
@@ -287,9 +295,11 @@ class TestVerificationGating:
         event = build_event(aapl_doc(t_event), ("AAPL",))
 
         unver = SignalEngine(market, self._graph(), EngineConfig(
-            move_scale=dict(DEFAULT_MOVE_SCALE), unverified_penalty=0.6))
+            move_scale=dict(DEFAULT_MOVE_SCALE), unverified_penalty=0.6,
+            verified_links_only=False))
         ver = SignalEngine(market, self._graph(lag_capture=0.8, dead_rate=0.1),
-                           EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE)))
+                           EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE),
+                                        verified_links_only=False))
 
         a = unver.evaluate_second_order(event)[0]
         b = ver.evaluate_second_order(event)[0]
@@ -301,24 +311,37 @@ class TestVerificationGating:
         market, t_event = self._market()
         event = build_event(aapl_doc(t_event), ("AAPL",))
         sig = SignalEngine(market, self._graph(), EngineConfig(
-            move_scale=dict(DEFAULT_MOVE_SCALE))).evaluate_second_order(event)[0]
+            move_scale=dict(DEFAULT_MOVE_SCALE),
+            verified_links_only=False)).evaluate_second_order(event)[0]
         assert any("UNVERIFIED" in n for n in sig.notes)
 
-    def test_verified_only_mode_silences_an_unverified_graph(self):
-        """Correct behaviour with zero measurements: emit nothing."""
+    def test_the_default_is_silent_on_an_unmeasured_graph(self):
+        """The shipped default must not trade a thesis the evidence refutes.
+
+        verified_links_only defaults to True and nothing in the shipped graph is
+        measured, so the second-order path emits nothing until validate.py
+        produces evidence. That silence is the intended behaviour.
+        """
         market, t_event = self._market()
         event = build_event(aapl_doc(t_event), ("AAPL",))
-        engine = SignalEngine(market, self._graph(), EngineConfig(
-            move_scale=dict(DEFAULT_MOVE_SCALE), verified_links_only=True))
+        engine = SignalEngine(market, self._graph(),
+                              EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE)))
+        assert engine.cfg.verified_links_only is True
         assert engine.evaluate_second_order(event) == []
         assert engine.rejected.get("no_verified_links")
+
+    def test_shipped_engine_and_graph_together_emit_nothing(self):
+        """End to end on the real defaults: no config, no graph override."""
+        market, t_event = self._market()
+        event = build_event(aapl_doc(t_event), ("AAPL",))
+        engine = SignalEngine(market)   # real graph, real defaults
+        assert [s for s in engine.on_event(event) if s.hop == 1] == []
 
     def test_verified_only_mode_passes_a_measured_link(self):
         market, t_event = self._market()
         event = build_event(aapl_doc(t_event), ("AAPL",))
         engine = SignalEngine(market, self._graph(lag_capture=0.8, dead_rate=0.1),
-                              EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE),
-                                           verified_links_only=True))
+                              EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE)))
         assert len(engine.evaluate_second_order(event)) == 1
 
     def test_measured_but_instant_repricer_is_not_tradeable(self):

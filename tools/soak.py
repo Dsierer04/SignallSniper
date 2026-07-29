@@ -115,6 +115,12 @@ async def run(args) -> int:
     runner = Runner(cfg, resolver=resolver)
     runner.on_signal = lambda s: None  # silence; we measure, not narrate
 
+    # This harness measures pipeline THROUGHPUT under a burst, not signal
+    # quality. In production verified_links_only defaults to True and the
+    # shipped graph has nothing measured, so the second-order path emits
+    # nothing -- correct, but it would leave this test with no signal to time.
+    runner.engine.cfg.verified_links_only = False
+
     # Seed tapes so the second-order path has references to work from.
     t_pre = now_ns() - 8_000_000_000
     for tick, px in (("AAPL", 232.0), ("CRUS", 104.0), ("SWKS", 78.0),

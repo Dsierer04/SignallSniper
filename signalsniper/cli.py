@@ -137,12 +137,34 @@ async def cmd_demo(args) -> int:
     print(f"  channels    : {sorted(detect_channels(doc.title + ' ' + doc.body, 'AAPL'))}")
     print(f"  classify latency: {event.ingest_latency_us:.0f}us")
 
-    engine = SignalEngine(market, LinkageGraph(),
+    graph = LinkageGraph.calibrated()
+    cov = graph.coverage()
+    print(f"\n== linkage coverage ==")
+    print(f"  {cov['verified']}/{cov['total']} links measured against history, "
+          f"{cov['tradeable']} clear the lag bar")
+
+    # Default posture: only propagate through MEASURED links. On the shipped
+    # graph nothing is measured, so this emits nothing -- and that silence is
+    # correct, because the minutes-scale thesis was refuted (docs/VERIFICATION.md).
+    engine = SignalEngine(market, graph,
                           EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE)))
     risk = RiskManager(RiskConfig(equity=25_000.0))
 
     signals = engine.on_event(event)
-    print(f"\n== signals ({len(signals)}) ==")
+    print(f"\n== signals on the real defaults ({len(signals)}) ==")
+    if not signals:
+        print("  none -- no link has been measured, so nothing propagates.")
+        print("  Run: python3 tools/validate.py --primary AAPL --feed sip")
+        print("  Links that clear the lag bar start firing on their own.")
+
+    if args.unverified:
+        print("\n== what it WOULD emit on unverified links (--unverified) ==")
+        engine = SignalEngine(market, graph, EngineConfig(
+            move_scale=dict(DEFAULT_MOVE_SCALE), verified_links_only=False))
+        risk = RiskManager(RiskConfig(equity=25_000.0))
+        signals = engine.on_event(event)
+        print(f"  {len(signals)} signal(s) -- acting on these means acting "
+              f"without evidence")
     for s in signals:
         print(f"  {s.describe()}")
         for n in s.notes:
@@ -361,7 +383,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", help="verify credentials and connectivity")
-    sub.add_parser("demo", help="offline end-to-end proof")
+    d = sub.add_parser("demo", help="offline end-to-end proof")
+    d.add_argument("--unverified", action="store_true",
+                   help="also show what it would emit on unmeasured links")
     sub.add_parser("preflight", help="check account, session and feed before trading")
     sub.add_parser("flatten", help="PANIC: cancel all orders and close all positions")
 
