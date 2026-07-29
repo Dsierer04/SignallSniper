@@ -41,6 +41,14 @@ class EngineConfig:
     max_event_bps: float = 1800.0
     #: Reject anything under this much remaining edge -- it will not clear costs.
     min_edge_bps: float = 80.0
+    #: Reject anything OVER this much too. An implied move of 3000bps is not an
+    #: opportunity, it is a corrupt tape: a stale reference, a bad tick that
+    #: survived the outlier gate, or a symbol whose price series has a gap in it.
+    #: Real edges are bounded; a spectacular one is a bug until proven otherwise.
+    max_edge_bps: float = 1_500.0
+    #: Sanity bound on the primary's observed move. Beyond this we are reading a
+    #: broken series, not a repricing.
+    max_primary_bps: float = 3_000.0
     #: At least this fraction of the expected move must still be unpriced.
     min_slack_frac: float = 0.35
     #: Below this classifier confidence we do not act at all.
@@ -149,6 +157,9 @@ class SignalEngine:
         if residual < cfg.min_edge_bps:
             self._reject("residual_below_min")
             return None
+        if residual > cfg.max_edge_bps:
+            self._reject("edge_implausible")
+            return None
         if slack < cfg.min_slack_frac:
             self._reject("already_priced")
             return None
@@ -193,6 +204,11 @@ class SignalEngine:
         if abs(primary_move) < cfg.min_primary_bps:
             self._reject("primary_not_moved")
             return []
+        if abs(primary_move) > cfg.max_primary_bps:
+            # Propagating a corrupt primary move multiplies the corruption
+            # across every linked name at once.
+            self._reject("primary_implausible")
+            return []
 
         channels = detect_channels(f"{event.doc.title} {event.doc.body}", src)
         links = self.graph.neighbors(src, channels or None, cfg.min_beta,
@@ -227,6 +243,9 @@ class SignalEngine:
                 continue
             if abs(residual) < cfg.min_edge_bps:
                 self._reject("residual_below_min")
+                continue
+            if abs(residual) > cfg.max_edge_bps:
+                self._reject("edge_implausible")
                 continue
 
             slack = abs(residual) / abs(implied)

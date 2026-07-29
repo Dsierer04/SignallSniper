@@ -34,9 +34,11 @@ class TickerTape:
     """Bounded rolling history for one symbol."""
 
     __slots__ = ("ticker", "_t", "_px", "_sz", "maxlen", "last_quote",
-                 "_vol_buckets", "_bucket_s")
+                 "_vol_buckets", "_bucket_s", "outlier_bps", "_pending",
+                 "rejected_ticks")
 
-    def __init__(self, ticker: str, maxlen: int = 20_000, bucket_s: float = 1.0) -> None:
+    def __init__(self, ticker: str, maxlen: int = 20_000, bucket_s: float = 1.0,
+                 outlier_bps: float = 1_500.0) -> None:
         self.ticker = ticker.upper()
         # Plain lists, not deques. bisect needs random access into a sorted
         # sequence; a deque gives O(n) indexing, and converting one to a list per
@@ -50,6 +52,14 @@ class TickerTape:
         self.last_quote: Quote | None = None
         self._bucket_s = bucket_s
         self._vol_buckets: deque[tuple[int, int]] = deque(maxlen=1800)
+        #: A single print further than this from the last accepted one is held
+        #: rather than trusted. Bad ticks are routine on thin after-hours names,
+        #: and one of them reading as a 2800bps move is enough to manufacture a
+        #: signal out of nothing -- and then a stop derived from that phantom
+        #: edge is placed so far away it is not a stop at all.
+        self.outlier_bps = outlier_bps
+        self._pending: Quote | None = None
+        self.rejected_ticks = 0
 
     def _trim(self) -> None:
         """Drop the oldest quarter once we exceed maxlen. Amortised O(1)/append."""
@@ -62,7 +72,42 @@ class TickerTape:
 
     # ---- ingest --------------------------------------------------------
 
+    def _is_outlier(self, px: float) -> bool:
+        if not self._px:
+            return False
+        last = self._px[-1]
+        if last <= 0:
+            return False
+        return abs(px - last) / last * 10_000.0 > self.outlier_bps
+
     def on_quote(self, q: Quote) -> None:
+        px = q.mid
+        if px <= 0:
+            return
+
+        # Outlier gate with confirmation. A genuine earnings gap arrives as a
+        # sequence of prints that agree with each other; a bad tick is a single
+        # print that nothing corroborates. So hold the first surprising print,
+        # and only accept it once a second one lands near it. This costs one
+        # tick of latency on a real gap and rejects the fabricated move entirely.
+        if self._is_outlier(px):
+            if self._pending is not None and self._pending.mid > 0:
+                drift = abs(px - self._pending.mid) / self._pending.mid * 10_000.0
+                if drift <= self.outlier_bps:
+                    confirmed = self._pending
+                    self._pending = None
+                    self.rejected_ticks -= 1  # it was real after all
+                    self._accept(confirmed)
+                    self._accept(q)
+                    return
+            self._pending = q
+            self.rejected_ticks += 1
+            return
+
+        self._pending = None
+        self._accept(q)
+
+    def _accept(self, q: Quote) -> None:
         self.last_quote = q
         px = q.mid
         if px <= 0:

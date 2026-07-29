@@ -40,6 +40,17 @@ class RiskConfig:
     stop_frac_of_edge: float = 0.60
     #: Never place a stop tighter than this -- noise would take you out.
     min_stop_bps: float = 40.0
+    #: And never wider than this. The stop distance is derived from the signal's
+    #: edge, so a corrupt edge produces a corrupt stop -- and a stop placed 60%
+    #: away is not a stop, it is a position with no floor under it. This cap is
+    #: the last line: even if every upstream sanity check fails, the loss on any
+    #: single trade stays bounded.
+    #:
+    #: Set to match the engine's own ceiling rather than undercut it: the engine
+    #: caps edge at 1500bps and stop_frac_of_edge is 0.60, so 900bps is the
+    #: widest stop a *sane* signal can produce. A backstop tighter than that
+    #: would silently veto legitimate trades instead of catching corrupt ones.
+    max_stop_bps: float = 900.0
     #: Absolute floor on order size, below which commissions dominate.
     min_shares: int = 1
     min_notional: float = 200.0
@@ -156,6 +167,11 @@ class RiskManager:
 
         px = signal.ref_price
         stop_bps = max(cfg.min_stop_bps, signal.edge_bps * cfg.stop_frac_of_edge)
+        if stop_bps > cfg.max_stop_bps:
+            # Do not silently clamp: a stop this wide means the edge that
+            # produced it is not trustworthy, so the trade should not happen.
+            self._reject("stop_too_wide")
+            return None
         stop_dist = px * stop_bps / 10_000.0
         if stop_dist <= 0:
             self._reject("bad_stop")
