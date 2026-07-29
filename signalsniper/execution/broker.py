@@ -62,6 +62,43 @@ class Fill:
 
 
 @dataclass(slots=True)
+class OrderStatus:
+    """What the broker says actually happened, as opposed to what we asked for.
+
+    The distinction is not pedantic. A limit order that never filled leaves the
+    risk manager believing it holds a position it does not have -- it will then
+    decline other trades against `max_concurrent`, and on a stop trigger it will
+    send a *closing* order for shares that were never bought, opening a real
+    position in the opposite direction. Assuming the fill is how a missed entry
+    becomes an unintended short.
+    """
+
+    order_id: str
+    status: str = ""           # new, partially_filled, filled, canceled, rejected...
+    filled_qty: int = 0
+    filled_avg_price: float = 0.0
+    requested_qty: int = 0
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in {"filled", "canceled", "expired", "rejected", "done_for_day"}
+
+    @property
+    def is_open(self) -> bool:
+        return self.status in {"new", "accepted", "pending_new", "partially_filled",
+                               "accepted_for_bidding"}
+
+    @property
+    def got_nothing(self) -> bool:
+        return self.filled_qty <= 0
+
+    def describe(self) -> str:
+        return (f"{self.order_id[:12]} {self.status} "
+                f"{self.filled_qty}/{self.requested_qty} @ {self.filled_avg_price:.2f}")
+
+
+@dataclass(slots=True)
 class AccountSnapshot:
     equity: float = 0.0
     buying_power: float = 0.0
@@ -146,6 +183,34 @@ class AlpacaBroker:
         r = await self.client.get(f"{self.base}/v2/positions", headers=self._headers)
         r.raise_for_status()
         return r.json()
+
+    async def order_status(self, order_id: str) -> OrderStatus:
+        try:
+            r = await self.client.get(f"{self.base}/v2/orders/{order_id}",
+                                      headers=self._headers)
+        except Exception as exc:
+            log.error("order_status(%s) failed: %r", order_id, exc)
+            return OrderStatus(order_id=order_id, status="unknown")
+        if r.status_code >= 400:
+            return OrderStatus(order_id=order_id, status="unknown")
+        d = r.json()
+        return OrderStatus(
+            order_id=order_id,
+            status=str(d.get("status", "")),
+            filled_qty=int(float(d.get("filled_qty") or 0)),
+            filled_avg_price=float(d.get("filled_avg_price") or 0.0),
+            requested_qty=int(float(d.get("qty") or 0)),
+            raw=d,
+        )
+
+    async def cancel_order(self, order_id: str) -> bool:
+        try:
+            r = await self.client.delete(f"{self.base}/v2/orders/{order_id}",
+                                         headers=self._headers)
+        except Exception as exc:
+            log.error("cancel_order(%s) failed: %r", order_id, exc)
+            return False
+        return r.status_code < 400
 
     # ---- writes --------------------------------------------------------
 
@@ -256,10 +321,28 @@ class PaperBroker:
         self.fills: list[Fill] = []
         self._seq = 0
 
+    #: Override in tests to simulate an order that never fills, or fills short.
+    fill_behaviour: str = "full"   # "full" | "none" | "partial"
+
     async def account(self) -> AccountSnapshot:
         return AccountSnapshot(equity=self.equity, buying_power=self.equity * 2,
                                cash=self.equity, shorting_enabled=self.shorting_enabled,
                                account_number="PAPER", is_paper=True)
+
+    async def order_status(self, order_id: str) -> OrderStatus:
+        order = next((o for f, o in zip(self.fills, self.submitted)
+                      if f.broker_order_id == order_id), None)
+        qty = order.shares if order else 0
+        if self.fill_behaviour == "none":
+            return OrderStatus(order_id, "new", 0, 0.0, qty)
+        if self.fill_behaviour == "partial":
+            return OrderStatus(order_id, "partially_filled", max(1, qty // 2),
+                               order.limit if order else 0.0, qty)
+        return OrderStatus(order_id, "filled", qty,
+                           order.limit if order else 0.0, qty)
+
+    async def cancel_order(self, order_id: str) -> bool:
+        return True
 
     async def submit(self, order: Order, session: SessionInfo | None = None) -> Fill:
         sess = session or current_session()

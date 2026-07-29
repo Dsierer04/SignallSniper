@@ -16,7 +16,7 @@ from typing import Callable
 
 from .bus import TOPIC_EVENT, TOPIC_QUOTE, TOPIC_RAW, TOPIC_SIGNAL, EventBus
 from .config import Config
-from .execution.broker import Broker, Fill
+from .execution.broker import Broker, Fill, OrderStatus
 from .execution.session import current_session
 from .feeds.base import TokenBucket, build_client
 from .feeds.edgar import EdgarCurrentFeed, TickerResolver
@@ -24,7 +24,7 @@ from .feeds.newswire import PUBLIC_WIRES, RssFeed
 from .market.linkage import LinkageGraph
 from .market.quotes import QuoteSource
 from .market.tape import MarketState
-from .models import Event, Quote, RawDoc, Signal
+from .models import Event, Quote, RawDoc, Signal, now_ns
 from .parse.classify import build_event
 from .signal.engine import DEFAULT_MOVE_SCALE, EngineConfig, SignalEngine
 from .signal.risk import Order, RiskConfig, RiskManager
@@ -68,7 +68,7 @@ class Runner:
         self.feeds: list = []
         self._watch = {t.upper() for t in cfg.watchlist}
         self.counts = {"docs": 0, "events": 0, "signals": 0, "orders": 0,
-                       "accepted": 0, "rejected": 0}
+                       "accepted": 0, "rejected": 0, "unfilled": 0}
 
         # Subscribe eagerly at construction, not inside the loop coroutines. A
         # task does not run until the scheduler gets to it, so subscribing there
@@ -170,6 +170,9 @@ class Runner:
                 self.risk.open(order)
                 if fill.stop_is_client_side:
                     self.client_side_stops.add(order.ticker)
+                # Do not block the signal loop waiting on a fill -- the next
+                # event may already be in the queue.
+                asyncio.create_task(self._reconcile(order, fill.broker_order_id))
 
     async def _quote_loop(self, source: QuoteSource) -> None:
         async for q in source.stream():
@@ -196,6 +199,66 @@ class Runner:
                     self.client_side_stops.discard(ticker)
                     if self.cfg.live and self.broker is not None:
                         await self._close_at_broker(ticker, direction, shares, px, why, sig)
+
+    async def _reconcile(self, order: Order, broker_order_id: str,
+                         timeout_s: float = 45.0, poll_s: float = 1.5) -> None:
+        """Make the risk manager's position match what the broker actually did.
+
+        Without this the system trades on a fiction. A limit that never fills
+        leaves a phantom position occupying a `max_concurrent` slot, and when
+        the price crosses its stop the exit logic sends a closing order for
+        shares that were never bought -- which does not flatten anything, it
+        opens a real position in the opposite direction.
+        """
+        if not broker_order_id or self.broker is None:
+            return
+
+        deadline = now_ns() + int(timeout_s * 1e9)
+        last: Fill | None = None
+        while now_ns() < deadline:
+            await asyncio.sleep(poll_s)
+            status = await self.broker.order_status(broker_order_id)
+
+            if status.status == "unknown":
+                continue
+
+            if status.filled_qty > 0 and status.filled_avg_price > 0:
+                pos = self.risk.positions.get(order.ticker)
+                if pos is not None and (
+                    pos.shares != status.filled_qty
+                    or abs(pos.entry - status.filled_avg_price) > 0.005
+                ):
+                    log.warning(
+                        "reconcile %s: assumed %d @ %.2f, actual %d @ %.2f",
+                        order.ticker, pos.shares, pos.entry,
+                        status.filled_qty, status.filled_avg_price,
+                    )
+                    self.risk.amend_fill(order.ticker, status.filled_qty,
+                                         status.filled_avg_price)
+
+            if status.is_terminal:
+                if status.got_nothing:
+                    log.warning("reconcile %s: %s with no fill -- dropping phantom "
+                                "position", order.ticker, status.status)
+                    self.risk.drop_unfilled(order.ticker)
+                    self.client_side_stops.discard(order.ticker)
+                    self.counts["unfilled"] += 1
+                return
+
+        # Timed out still working. An entry that has not filled in 45s is stale:
+        # the move it was chasing has either happened or not, and a late fill is
+        # a position taken on a thesis that has already expired.
+        log.warning("reconcile %s: no terminal state in %.0fs -- cancelling",
+                    order.ticker, timeout_s)
+        await self.broker.cancel_order(broker_order_id)
+        final = await self.broker.order_status(broker_order_id)
+        if final.got_nothing:
+            self.risk.drop_unfilled(order.ticker)
+            self.client_side_stops.discard(order.ticker)
+            self.counts["unfilled"] += 1
+        elif final.filled_qty > 0:
+            self.risk.amend_fill(order.ticker, final.filled_qty,
+                                 final.filled_avg_price or order.limit)
 
     async def _close_at_broker(self, ticker: str, direction, shares: int,
                                px: float, why: str, sig: Signal) -> None:

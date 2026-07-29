@@ -223,6 +223,37 @@ class RiskManager:
         log.info("OPEN %s", order.describe())
         return pos
 
+    def amend_fill(self, ticker: str, shares: int, avg_price: float) -> None:
+        """Correct a position to the broker's actual fill.
+
+        Stop and target are recomputed from the real entry rather than kept at
+        the levels derived from the assumed one -- a stop measured from a price
+        you did not get is the wrong distance from the price you did.
+        """
+        pos = self.positions.get(ticker)
+        if pos is None or shares <= 0 or avg_price <= 0:
+            return
+        stop_dist = abs(pos.entry - pos.stop)
+        target_dist = abs(pos.target - pos.entry)
+        sign = pos.direction.value
+        pos.shares = shares
+        pos.entry = avg_price
+        pos.stop = round(avg_price - sign * stop_dist, 2)
+        pos.target = round(avg_price + sign * target_dist, 2)
+
+    def drop_unfilled(self, ticker: str) -> bool:
+        """Remove a position that the broker never actually gave us.
+
+        Deliberately not `close()`: there was no fill, so there is no P&L to
+        realise and no cooldown to serve. Booking a phantom round trip would
+        corrupt the daily loss figure the kill switch reads.
+        """
+        if ticker not in self.positions:
+            return False
+        del self.positions[ticker]
+        log.info("dropped unfilled position %s", ticker)
+        return True
+
     def close(self, ticker: str, price: float, why: str = "") -> float:
         pos = self.positions.pop(ticker, None)
         if pos is None:
