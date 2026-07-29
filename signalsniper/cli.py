@@ -220,9 +220,30 @@ async def cmd_watch(args) -> int:
     runner = Runner(cfg, broker=broker)
     source = None
     if cfg.alpaca_key and cfg.alpaca_secret:
+        # The free Basic plan allows ONE connection and 30 channels across
+        # trades+quotes. Exceeding it gets the subscription rejected, which
+        # presents as a connected socket delivering nothing. Fit the budget by
+        # dropping trades first (quotes carry the bid/ask the engine needs),
+        # then by capping symbols -- and say which, rather than silently
+        # truncating.
+        cap = 30 if cfg.alpaca_feed == "iex" else 10_000
         source = AlpacaQuoteStream(
-            cfg.alpaca_key, cfg.alpaca_secret, cfg.watchlist, feed=cfg.alpaca_feed
+            cfg.alpaca_key, cfg.alpaca_secret, cfg.watchlist,
+            feed=cfg.alpaca_feed, max_symbols=cap,
         )
+        ok, why = source.channel_budget_ok(cap)
+        if not ok:
+            log.warning("%s -- dropping trade subscriptions to fit", why)
+            source.subscribe_trades = False
+            ok, why = source.channel_budget_ok(cap)
+        if not ok:
+            keep = list(cfg.watchlist)[:cap]
+            log.warning("%s -- trimming to %d symbols: %s",
+                        why, len(keep), ",".join(keep))
+            log.warning("dropped: %s",
+                        ",".join(t for t in cfg.watchlist if t not in keep))
+            source.symbols = keep
+        log.info("quote stream: %s", source.channel_budget_ok(cap)[1])
     else:
         logging.getLogger("signalsniper").error(
             "no market data credentials -- second-order signals are DISABLED "

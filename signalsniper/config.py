@@ -9,6 +9,34 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def load_env_file(path: str | Path = ".env") -> int:
+    """Read a .env into os.environ without overwriting real env vars.
+
+    Without this, a perfectly filled-in .env that nobody sources means the app
+    runs on defaults -- EQUITY=25000, no API keys -- and says nothing about the
+    file existing. Silent misconfiguration is the failure mode this whole
+    codebase keeps having to defend against, so read the file.
+
+    Real environment variables win, so `EQUITY=500 python3 -m signalsniper ...`
+    still overrides the file.
+    """
+    p = Path(path)
+    if not p.exists():
+        return 0
+    n = 0
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+            n += 1
+    return n
 
 
 def _f(name: str, default: float) -> float:
@@ -137,6 +165,7 @@ JUL30_BLACKOUT: frozenset[str] = frozenset({"SWKS", "QRVO"})
 
 
 def load(**overrides) -> Config:
+    load_env_file()
     cfg = Config(**overrides)
     if not cfg.watchlist:
         cfg.watchlist = JUL30_WATCHLIST
