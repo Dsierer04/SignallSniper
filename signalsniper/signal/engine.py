@@ -57,6 +57,16 @@ class EngineConfig:
     ttl_s: float = 300.0
     #: Per-ticker damping. Mega caps move less on the same news.
     move_scale: dict[str, float] | None = None
+    #: Only propagate through links whose lag has been measured against history
+    #: by tools/validate.py and found tradeable. Off by default because the
+    #: shipped graph is entirely unverified -- turning it on with no measurements
+    #: silences the system completely, which is the correct behaviour but a
+    #: confusing default.
+    verified_links_only: bool = False
+    #: Confidence multiplier applied to links that have never been checked
+    #: against the tape. An unchecked economic story is not worth the same as a
+    #: measured one.
+    unverified_penalty: float = 0.60
 
     def scale_for(self, ticker: str) -> float:
         if not self.move_scale:
@@ -185,9 +195,10 @@ class SignalEngine:
             return []
 
         channels = detect_channels(f"{event.doc.title} {event.doc.body}", src)
-        links = self.graph.neighbors(src, channels or None, cfg.min_beta)
+        links = self.graph.neighbors(src, channels or None, cfg.min_beta,
+                                     verified_only=cfg.verified_links_only)
         if not links:
-            self._reject("no_links")
+            self._reject("no_verified_links" if cfg.verified_links_only else "no_links")
             return []
 
         signals: list[Signal] = []
@@ -230,8 +241,12 @@ class SignalEngine:
 
             direction = Direction.LONG if residual > 0 else Direction.SHORT
             # Confidence discounts by beta: a 0.85-beta link is a far tighter
-            # economic claim than a 0.15-beta "read-through".
+            # economic claim than a 0.15-beta "read-through". It discounts again
+            # if the link's lag has never been measured -- a plausible economic
+            # story and a story checked against the tape are not the same asset.
             conf = event.confidence * slack * min(1.0, link.beta + 0.15)
+            if not link.verified:
+                conf *= cfg.unverified_penalty
 
             signals.append(
                 Signal(
@@ -248,6 +263,9 @@ class SignalEngine:
                         f"beta={link.beta:.2f} pol={link.polarity:+d} ch={link.channel}",
                         f"implied={implied:+.0f}bps actual={actual:+.0f}bps",
                         f"slack={slack:.0%}",
+                        (f"lag VERIFIED: {link.lag_capture:.0%} available @5m"
+                         if link.verified else
+                         "lag UNVERIFIED -- never measured against history"),
                         link.note,
                     ),
                 )

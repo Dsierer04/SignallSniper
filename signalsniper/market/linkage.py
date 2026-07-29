@@ -41,6 +41,35 @@ class Link:
     lag_s: float = 120.0  # typical seconds before the crowd gets there
     note: str = ""
 
+    #: Fraction of this name's post-event move that was still available 5 minutes
+    #: after the primary printed, measured over historical events by
+    #: `tools/validate.py`. **None means UNVERIFIED** -- the link is an economic
+    #: story that has never been checked against what the tape actually did.
+    #:
+    #: This is deliberately separate from `beta`, because they answer different
+    #: questions and a high beta does not imply a tradeable one. Two names can
+    #: have identical exposure to the primary while one reprices in the first
+    #: minute and the other takes half an hour. Only the second is a trade; beta
+    #: alone cannot tell you which is which.
+    lag_capture: float | None = None
+
+    #: Rate at which this name had NO prints in the first 5 minutes after past
+    #: events. High values mean "hasn't moved" usually meant "hasn't traded".
+    dead_rate: float | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.lag_capture is not None
+
+    @property
+    def tradeable_lag(self) -> bool:
+        """Cleared the empirical bar. False for anything unverified."""
+        if self.lag_capture is None:
+            return False
+        if self.dead_rate is not None and self.dead_rate > 0.35:
+            return False
+        return self.lag_capture >= 0.50
+
     @property
     def key(self) -> tuple[str, str, str]:
         return (self.src, self.dst, self.channel)
@@ -140,13 +169,24 @@ class LinkageGraph:
             bucket.sort(key=lambda x: -x.beta)
 
     def neighbors(self, src: str, channels: frozenset[str] | None = None,
-                  min_beta: float = 0.0) -> list[Link]:
+                  min_beta: float = 0.0, verified_only: bool = False) -> list[Link]:
         out = self._out.get(src.upper(), [])
         if channels is not None:
             out = [x for x in out if x.channel in channels]
         if min_beta > 0:
             out = [x for x in out if x.beta >= min_beta]
+        if verified_only:
+            out = [x for x in out if x.tradeable_lag]
         return out
+
+    def coverage(self) -> dict[str, int]:
+        """How much of this graph has actually been checked against the tape."""
+        all_links = [l for bucket in self._out.values() for l in bucket]
+        return {
+            "total": len(all_links),
+            "verified": sum(1 for l in all_links if l.verified),
+            "tradeable": sum(1 for l in all_links if l.tradeable_lag),
+        }
 
     def sources(self) -> list[str]:
         return sorted(self._out)
@@ -154,6 +194,59 @@ class LinkageGraph:
     def add(self, link: Link) -> None:
         self._out.setdefault(link.src, []).append(link)
         self._out[link.src].sort(key=lambda x: -x.beta)
+
+    def apply_calibration(self, calib: dict) -> int:
+        """Fold measurements from `tools/validate.py --emit` into the graph.
+
+        Replaces hand-set betas with empirical ones and attaches the lag
+        measurements that decide whether a link is tradeable at all. Only
+        overwrites beta when the regression is `usable` -- a beta from four
+        events with an r-squared of 0.1 is a number, not an improvement on a
+        considered prior.
+
+        Returns the number of links updated.
+        """
+        by_pair: dict[tuple[str, str], dict] = {}
+        for row in calib.get("links", []):
+            by_pair[(row["src"].upper(), row["dst"].upper())] = row
+
+        updated = 0
+        for src, bucket in self._out.items():
+            for i, link in enumerate(bucket):
+                row = by_pair.get((link.src.upper(), link.dst.upper()))
+                if row is None:
+                    continue
+                beta = link.beta
+                polarity = link.polarity
+                if row.get("beta_usable") and row.get("beta") is not None:
+                    measured = float(row["beta"])
+                    # An empirical beta carries its own sign; keep magnitude in
+                    # `beta` and sign in `polarity` so the rest of the engine's
+                    # arithmetic is unchanged.
+                    beta = abs(measured)
+                    polarity = -1 if measured < 0 else 1
+                bucket[i] = Link(
+                    src=link.src, dst=link.dst, beta=beta, channel=link.channel,
+                    polarity=polarity, lag_s=link.lag_s, note=link.note,
+                    lag_capture=row.get("lag_capture"),
+                    dead_rate=row.get("dead_rate"),
+                )
+                updated += 1
+            bucket.sort(key=lambda x: -x.beta)
+        return updated
+
+    @classmethod
+    def calibrated(cls, path: str = "calibration.json",
+                   links: list[Link] | None = None) -> "LinkageGraph":
+        """Build a graph, applying a calibration file if one exists."""
+        import json
+        import os
+
+        g = cls(links)
+        if os.path.exists(path):
+            with open(path) as fh:
+                g.apply_calibration(json.load(fh))
+        return g
 
 
 # ---------------------------------------------------------------------------

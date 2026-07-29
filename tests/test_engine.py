@@ -248,6 +248,162 @@ class TestChannelDetection:
         assert detect_channels("Acme reports results", "ZZZZ") == frozenset()
 
 
+class TestVerificationGating:
+    """A plausible economic story and a story measured against the tape are
+    not the same asset, and the engine must not price them the same."""
+
+    def _market(self):
+        market = MarketState()
+        t_pre = now_ns() - 8_000_000_000
+        for tick, px in (("AAPL", 232.0), ("CRUS", 104.0)):
+            seed(market, tick, px, t_pre, n=40)
+        t_event = now_ns()
+        seed(market, "AAPL", 232.0, t_event, n=30, drift=-420.0)
+        seed(market, "CRUS", 104.0, t_event, n=30, drift=-60.0)
+        return market, t_event
+
+    def _graph(self, **link_kw):
+        return LinkageGraph([
+            Link("AAPL", "CRUS", 0.85, "iphone_hardware", 1, 90, "test", **link_kw)
+        ])
+
+    def test_shipped_graph_is_entirely_unverified(self):
+        """Honesty check: nothing in the default graph has been measured."""
+        cov = LinkageGraph().coverage()
+        assert cov["total"] > 0
+        assert cov["verified"] == 0, (
+            "a link claims verification without a validate.py run behind it"
+        )
+
+    def test_unverified_link_is_confidence_penalised(self):
+        market, t_event = self._market()
+        event = build_event(aapl_doc(t_event), ("AAPL",))
+
+        unver = SignalEngine(market, self._graph(), EngineConfig(
+            move_scale=dict(DEFAULT_MOVE_SCALE), unverified_penalty=0.6))
+        ver = SignalEngine(market, self._graph(lag_capture=0.8, dead_rate=0.1),
+                           EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE)))
+
+        a = unver.evaluate_second_order(event)[0]
+        b = ver.evaluate_second_order(event)[0]
+        assert a.edge_bps == pytest.approx(b.edge_bps)   # same edge
+        assert a.confidence < b.confidence                # different trust
+        assert a.confidence == pytest.approx(b.confidence * 0.6, abs=0.01)
+
+    def test_signal_notes_state_verification_status(self):
+        market, t_event = self._market()
+        event = build_event(aapl_doc(t_event), ("AAPL",))
+        sig = SignalEngine(market, self._graph(), EngineConfig(
+            move_scale=dict(DEFAULT_MOVE_SCALE))).evaluate_second_order(event)[0]
+        assert any("UNVERIFIED" in n for n in sig.notes)
+
+    def test_verified_only_mode_silences_an_unverified_graph(self):
+        """Correct behaviour with zero measurements: emit nothing."""
+        market, t_event = self._market()
+        event = build_event(aapl_doc(t_event), ("AAPL",))
+        engine = SignalEngine(market, self._graph(), EngineConfig(
+            move_scale=dict(DEFAULT_MOVE_SCALE), verified_links_only=True))
+        assert engine.evaluate_second_order(event) == []
+        assert engine.rejected.get("no_verified_links")
+
+    def test_verified_only_mode_passes_a_measured_link(self):
+        market, t_event = self._market()
+        event = build_event(aapl_doc(t_event), ("AAPL",))
+        engine = SignalEngine(market, self._graph(lag_capture=0.8, dead_rate=0.1),
+                              EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE),
+                                           verified_links_only=True))
+        assert len(engine.evaluate_second_order(event)) == 1
+
+    def test_measured_but_instant_repricer_is_not_tradeable(self):
+        """High beta, measured, and still no edge -- it repriced with the primary."""
+        link = Link("AAPL", "CRUS", 0.85, "iphone_hardware", 1, 90, "t",
+                    lag_capture=0.05, dead_rate=0.0)
+        assert link.verified is True
+        assert link.tradeable_lag is False
+
+    def test_illiquid_name_is_not_tradeable_even_with_a_good_lag(self):
+        """'Hasn't moved' meant 'hasn't traded' on most past events."""
+        link = Link("AAPL", "CRUS", 0.85, "iphone_hardware", 1, 90, "t",
+                    lag_capture=0.90, dead_rate=0.60)
+        assert link.tradeable_lag is False
+
+
+class TestCalibration:
+    """Measurements from tools/validate.py must flow into the graph correctly."""
+
+    CALIB = {"links": [
+        # lags and trades -> tradeable
+        {"src": "AAPL", "dst": "CRUS", "lag_capture": 0.72, "dead_rate": 0.12,
+         "beta": 0.62, "beta_r2": 0.55, "beta_usable": True},
+        # reprices instantly -> not tradeable despite a fine beta
+        {"src": "AAPL", "dst": "SWKS", "lag_capture": 0.18, "dead_rate": 0.10,
+         "beta": 0.51, "beta_r2": 0.48, "beta_usable": True},
+        # lags but barely trades -> not tradeable
+        {"src": "AAPL", "dst": "QRVO", "lag_capture": 0.80, "dead_rate": 0.55,
+         "beta": 0.40, "beta_r2": 0.40, "beta_usable": True},
+        # measured, but the regression is junk -> keep the considered prior
+        {"src": "AAPL", "dst": "GLW", "lag_capture": 0.60, "dead_rate": 0.10,
+         "beta": -0.02, "beta_r2": 0.01, "beta_usable": False},
+    ]}
+
+    def _calibrated(self):
+        g = LinkageGraph()
+        g.apply_calibration(self.CALIB)
+        return {l.dst: l for l in g.neighbors("AAPL")}
+
+    def test_coverage_reflects_what_was_measured(self):
+        g = LinkageGraph()
+        assert g.coverage()["verified"] == 0
+        g.apply_calibration(self.CALIB)
+        cov = g.coverage()
+        assert cov["verified"] == 4
+        # CRUS and GLW both clear the lag bar. GLW's beta regression was junk,
+        # but beta usability and lag tradeability are independent questions --
+        # a name can have a measurable lag and an unmeasurable exposure.
+        assert cov["tradeable"] == 2
+
+    def test_empirical_beta_replaces_the_prior(self):
+        links = self._calibrated()
+        assert links["CRUS"].beta == pytest.approx(0.62)  # was 0.85
+
+    def test_unusable_regression_does_not_overwrite_the_prior(self):
+        """r2 of 0.01 is a number, not an improvement on a considered prior."""
+        links = self._calibrated()
+        assert links["GLW"].beta == pytest.approx(0.30)  # original prior kept
+        assert links["GLW"].verified is True             # but lag was measured
+
+    def test_instant_repricer_is_excluded_from_verified_only(self):
+        g = LinkageGraph()
+        g.apply_calibration(self.CALIB)
+        passing = {l.dst for l in g.neighbors("AAPL", verified_only=True)}
+        assert "CRUS" in passing          # lags and trades
+        assert "SWKS" not in passing      # repriced instantly
+        assert "QRVO" not in passing      # lags but barely trades
+
+    def test_illiquid_name_excluded_despite_good_lag(self):
+        links = self._calibrated()
+        assert links["QRVO"].lag_capture == 0.80
+        assert links["QRVO"].tradeable_lag is False
+
+    def test_negative_measured_beta_becomes_inverse_polarity(self):
+        g = LinkageGraph([Link("X", "Y", 0.5, "test", 1, 60, "n")])
+        g.apply_calibration({"links": [
+            {"src": "X", "dst": "Y", "lag_capture": 0.7, "dead_rate": 0.0,
+             "beta": -0.35, "beta_usable": True}]})
+        link = g.neighbors("X")[0]
+        assert link.beta == pytest.approx(0.35)
+        assert link.polarity == -1
+
+    def test_unlisted_links_are_untouched(self):
+        links = self._calibrated()
+        assert links["LITE"].verified is False
+        assert links["LITE"].beta == pytest.approx(0.35)
+
+    def test_missing_calibration_file_is_not_an_error(self):
+        g = LinkageGraph.calibrated("/nonexistent/path/calibration.json")
+        assert g.coverage()["verified"] == 0
+
+
 class TestLinkageGraph:
     def test_neighbors_sorted_by_beta_descending(self):
         links = LinkageGraph().neighbors("AAPL")
