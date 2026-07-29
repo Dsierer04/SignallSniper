@@ -43,12 +43,18 @@ trade. The same event thirty seconds later is somebody else's exit liquidity.
 pip install -r requirements.txt
 export SEC_USER_AGENT="Your Name you@example.com"   # SEC requires this; anonymous polling gets blocked
 
-python3 -m pytest -q               # 125 tests, no network needed
-python3 -m signalsniper demo       # end-to-end proof against a synthetic tape
-python3 -m signalsniper doctor     # verify credentials + SEC connectivity
-python3 -m signalsniper links AAPL # inspect the second-order map
-python3 -m signalsniper watch      # live, alert-only
+python3 -m pytest -q                # 155 tests, no network needed
+python3 -m signalsniper demo        # end-to-end proof against a synthetic tape
+python3 -m signalsniper doctor      # verify credentials + SEC connectivity
+python3 -m signalsniper preflight   # account, session, feed quality, PDT status
+python3 -m signalsniper links AAPL  # inspect the second-order map
+python3 -m signalsniper watch       # alert-only
+python3 -m signalsniper flatten     # PANIC: cancel everything, close everything
 ```
+
+> **This code has never made a live network call.** All 155 tests run against
+> fixtures. Before risking anything, read [docs/GO_LIVE.md](docs/GO_LIVE.md) —
+> the sequencing matters more than the code does.
 
 `demo` shows the gate working — AAPL is *refused* because it already repriced
 420bps, QRVO is refused as `overshot`, and CRUS/SWKS signal because the move that
@@ -74,12 +80,15 @@ risk manager still gets the final veto.
 | `signalsniper/parse/` | Deterministic classifier (item codes, form priors, headline rules) + numeric extraction |
 | `signalsniper/market/` | Linkage graph, rolling tape, quote sources |
 | `signalsniper/signal/` | The gate and the risk manager |
+| `signalsniper/execution/` | Broker submission and session legality |
 | `signalsniper/runner.py` | Async wiring |
 | `tools/bench.py` | Latency budget |
 | `legacy/` | The original Reddit scraper, demoted — see `docs/DATA_SOURCES.md` |
 
 ## Docs
 
+- **[docs/GO_LIVE.md](docs/GO_LIVE.md)** — how to actually get this running,
+  what you have to do yourself, and why the sequencing matters
 - **[docs/RUNBOOK_2026-07-30.md](docs/RUNBOOK_2026-07-30.md)** — the plan for
   tomorrow: what's playable, what isn't, and the kill conditions
 - [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) — the latency ladder, and why
@@ -116,7 +125,19 @@ All via environment (see `.env.example`). The ones that matter:
 | `RISK_PER_TRADE` | `0.01` | Fraction of equity risked to the stop |
 | `MAX_DAILY_LOSS` | `0.03` | Kill switch. Sticky — only an explicit resume clears it. |
 | `ALPACA_FEED` | `iex` | **`iex` is ~2% of volume and unusable after hours.** Use `sip` for the earnings window. |
-| `LIVE_TRADING` | `false` | Must be explicitly on, and `--live` passed |
+| `LIVE_TRADING` | `false` | Must be explicitly on, **and** `--live` passed |
+| `ALLOW_EXTENDED` | `false` | Separate opt-in. Extended hours has **no broker-side stop**. |
+
+## The extended-hours constraint
+
+**Alpaca rejects bracket orders outside regular hours** — after-hours is
+limit-only, DAY/GTC, `extended_hours=true`. The 16:05 earnings propagation trade
+is exactly that window, so **there is no broker-side stop on it**. The stop lives
+in the daemon; if the process dies, the position is unprotected.
+
+Handled explicitly rather than hidden: `ALLOW_EXTENDED` is a separate opt-in,
+`Fill.stop_is_client_side` is returned on every submission, and the runner
+flattens those positions on shutdown before tearing down.
 
 ## Known limits
 
@@ -133,6 +154,14 @@ All via environment (see `.env.example`). The ones that matter:
   for them; you need an estimates source.
 - No options support. The second-order thesis often expresses better in options
   after hours, where the underlying is thin.
+- **Never run against live data.** Every test is a fixture. First contact will
+  find integration bugs — unexpected XML shapes, symbol-format mismatches
+  (`BRK.B` vs `BRK-B`), websocket drops. Budget time for that.
+- Fills are assumed at the limit price. There is no fill reconciliation against
+  the broker, so a partial fill or a price improvement leaves internal state
+  slightly out of step with reality.
+- Sub-$25k accounts hit the PDT limit fast — this strategy is same-day round
+  trips and you get 3 per rolling 5 days.
 
 ## License
 

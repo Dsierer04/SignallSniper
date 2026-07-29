@@ -163,15 +163,38 @@ async def cmd_demo(args) -> int:
 
 
 async def cmd_watch(args) -> int:
+    from .execution.broker import AlpacaBroker
     from .market.quotes import AlpacaQuoteStream
     from .runner import Runner
 
+    log = logging.getLogger("signalsniper")
     cfg = load()
     if args.equity:
         cfg.equity = args.equity
-    cfg.live = bool(args.live)
+    # --live is an AND with the env flag, never an override. Two independent
+    # switches means a stale shell export cannot arm this on its own, and
+    # neither can a stray CLI flag.
+    cfg.live = bool(args.live) and cfg.live
 
-    runner = Runner(cfg)
+    broker = None
+    if cfg.live:
+        if not (cfg.alpaca_key and cfg.alpaca_secret):
+            log.error("LIVE_TRADING requested without broker credentials -- refusing")
+            return 1
+        broker = AlpacaBroker(cfg.alpaca_key, cfg.alpaca_secret,
+                              paper=cfg.alpaca_paper,
+                              allow_extended=cfg.allow_extended)
+        acct = await broker.account()
+        blockers = acct.blockers(need_short=True)
+        for b in blockers:
+            log.error("account: %s", b)
+        mode = "PAPER" if acct.is_paper else "*** LIVE MONEY ***"
+        log.warning("broker armed [%s] equity=$%s", mode, f"{acct.equity:,.2f}")
+    elif args.live:
+        log.error("--live passed but LIVE_TRADING is not set in the environment; "
+                  "staying alert-only")
+
+    runner = Runner(cfg, broker=broker)
     source = None
     if cfg.alpaca_key and cfg.alpaca_secret:
         source = AlpacaQuoteStream(
@@ -196,6 +219,113 @@ async def cmd_watch(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+
+
+async def cmd_preflight(args) -> int:
+    """Everything that can stop you at 16:05, checked at 15:00 instead."""
+    from .execution.broker import AlpacaBroker
+    from .execution.session import current_session
+
+    cfg = load()
+    rc = 0
+
+    print("== session ==")
+    s = current_session()
+    print(f"  now (ET)       : {s.now_et:%Y-%m-%d %H:%M:%S}")
+    print(f"  session        : {s.session.value}{' (' + s.note + ')' if s.note else ''}")
+    print(f"  bracket orders : {'yes' if s.supports_bracket else 'NO'}")
+    if s.is_extended:
+        print("  [!] extended hours: Alpaca rejects bracket orders here, so any")
+        print("      stop is enforced by this process only. If it dies, you are naked.")
+        print("      Requires ALLOW_EXTENDED=1 to trade at all.")
+
+    print("\n== market data ==")
+    if not (cfg.alpaca_key and cfg.alpaca_secret):
+        print("  [!] no Alpaca credentials -- second-order signals are IMPOSSIBLE")
+        print("      (they need a live tape on the LINKED names, not just issuers)")
+        rc = 1
+    else:
+        print(f"  feed           : {cfg.alpaca_feed}")
+        if cfg.alpaca_feed == "iex":
+            print("  [!] 'iex' is ~2% of consolidated volume. After-hours prints are")
+            print("      too thin to reference against -- the 16:05 window will")
+            print("      produce confident nonsense. Use 'sip' or sit that window out.")
+            rc = 1
+    print(f"  watchlist      : {len(cfg.watchlist)} symbols")
+
+    print("\n== broker ==")
+    if not (cfg.alpaca_key and cfg.alpaca_secret):
+        print("  [!] no credentials -- cannot place orders")
+        return 1
+
+    broker = AlpacaBroker(cfg.alpaca_key, cfg.alpaca_secret, paper=cfg.alpaca_paper)
+    try:
+        acct = await broker.account()
+    except Exception as exc:
+        print(f"  [!] account fetch FAILED: {exc!r}")
+        await broker.aclose()
+        return 1
+
+    print(f"  mode           : {'PAPER' if acct.is_paper else '*** LIVE ***'}")
+    print(f"  account        : {acct.account_number}")
+    print(f"  equity         : ${acct.equity:,.2f}")
+    print(f"  buying power   : ${acct.buying_power:,.2f}")
+    print(f"  day trades used: {acct.daytrade_count}")
+    print(f"  shorting       : {'enabled' if acct.shorting_enabled else 'DISABLED'}")
+
+    blockers = acct.blockers(need_short=True)
+    if blockers:
+        print()
+        for b in blockers:
+            print(f"  [!] {b}")
+        rc = 1
+
+    if abs(acct.equity - cfg.equity) > max(100.0, acct.equity * 0.05):
+        print(f"\n  [!] EQUITY env is ${cfg.equity:,.0f} but the account holds "
+              f"${acct.equity:,.0f}.")
+        print("      Sizing uses the env value. Fix it or you will size wrong.")
+        rc = 1
+
+    await broker.aclose()
+
+    print("\n== execution posture ==")
+    print(f"  LIVE_TRADING   : {cfg.live}")
+    if not cfg.live:
+        print("  -> alert only. No orders will be sent regardless of --live.")
+
+    print("\n" + ("PREFLIGHT FAILED -- fix the [!] items above" if rc
+                  else "preflight clean"))
+    return rc
+
+
+async def cmd_flatten(args) -> int:
+    """The panic button. Cancels every open order, closes every position."""
+    from .execution.broker import AlpacaBroker
+
+    cfg = load()
+    if not (cfg.alpaca_key and cfg.alpaca_secret):
+        print("no Alpaca credentials configured")
+        return 1
+
+    broker = AlpacaBroker(cfg.alpaca_key, cfg.alpaca_secret, paper=cfg.alpaca_paper)
+    try:
+        mode = "PAPER" if cfg.alpaca_paper else "*** LIVE ***"
+        print(f"[{mode}] cancelling orders and closing positions...")
+        cancelled = await broker.cancel_all()
+        closed = await broker.flatten_all()
+        print(f"  cancelled {cancelled} order(s)")
+        print(f"  closed    {closed} position(s)")
+        remaining = await broker.positions()
+        if remaining:
+            print(f"  [!] {len(remaining)} position(s) STILL OPEN:")
+            for p in remaining:
+                print(f"      {p.get('symbol')} qty={p.get('qty')}")
+            print("      Close these manually in the broker UI.")
+            return 1
+        print("  flat.")
+    finally:
+        await broker.aclose()
+    return 0
 
 
 async def cmd_links(args) -> int:
@@ -227,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("doctor", help="verify credentials and connectivity")
     sub.add_parser("demo", help="offline end-to-end proof")
+    sub.add_parser("preflight", help="check account, session and feed before trading")
+    sub.add_parser("flatten", help="PANIC: cancel all orders and close all positions")
 
     w = sub.add_parser("watch", help="live feeds, alert only unless --live")
     w.add_argument("--equity", type=float, default=None)
@@ -241,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
     fn = {
         "doctor": cmd_doctor,
         "demo": cmd_demo,
+        "preflight": cmd_preflight,
+        "flatten": cmd_flatten,
         "watch": cmd_watch,
         "links": cmd_links,
     }[args.cmd]

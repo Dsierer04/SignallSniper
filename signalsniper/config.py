@@ -64,6 +64,10 @@ class Config:
     # --- execution --------------------------------------------------------
     #: Nothing sends an order unless this is explicitly turned on.
     live: bool = field(default_factory=lambda: _b("LIVE_TRADING", False))
+    #: Extended hours cannot carry a broker-side stop (Alpaca rejects bracket
+    #: orders outside regular hours). Trading there means your process IS the
+    #: stop, so it must be opted into separately from LIVE_TRADING.
+    allow_extended: bool = field(default_factory=lambda: _b("ALLOW_EXTENDED", False))
 
     # --- watchlist --------------------------------------------------------
     #: Names we stream quotes for. Second-order signals are impossible without a
@@ -86,6 +90,16 @@ class Config:
             problems.append("LIVE_TRADING is on but ALPACA_PAPER is also on -- pick one")
         if self.risk_per_trade > 0.05:
             problems.append(f"RISK_PER_TRADE {self.risk_per_trade:.0%} is above 5% per trade")
+        if self.live and self.allow_extended:
+            problems.append(
+                "LIVE_TRADING + ALLOW_EXTENDED: extended-hours positions have NO "
+                "broker-side stop. If this process dies you are unprotected."
+            )
+        if self.live and self.alpaca_feed == "iex":
+            problems.append(
+                "LIVE_TRADING on the 'iex' feed: ~2% of consolidated volume makes "
+                "reference prices unreliable, especially after hours"
+            )
         return problems
 
 

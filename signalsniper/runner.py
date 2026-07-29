@@ -16,6 +16,8 @@ from typing import Callable
 
 from .bus import TOPIC_EVENT, TOPIC_QUOTE, TOPIC_RAW, TOPIC_SIGNAL, EventBus
 from .config import Config
+from .execution.broker import Broker, Fill
+from .execution.session import current_session
 from .feeds.base import TokenBucket, build_client
 from .feeds.edgar import EdgarCurrentFeed, TickerResolver
 from .feeds.newswire import PUBLIC_WIRES, RssFeed
@@ -41,8 +43,10 @@ class Runner:
         resolver: TickerResolver | None = None,
         on_signal: SignalSink | None = None,
         on_order: OrderSink | None = None,
+        broker: Broker | None = None,
     ) -> None:
         self.cfg = cfg
+        self.broker = broker
         self.bus = EventBus()
         self.market = market or MarketState()
         self.resolver = resolver or TickerResolver()
@@ -63,7 +67,8 @@ class Runner:
         self.stop = asyncio.Event()
         self.feeds: list = []
         self._watch = {t.upper() for t in cfg.watchlist}
-        self.counts = {"docs": 0, "events": 0, "signals": 0, "orders": 0}
+        self.counts = {"docs": 0, "events": 0, "signals": 0, "orders": 0,
+                       "accepted": 0, "rejected": 0}
 
         # Subscribe eagerly at construction, not inside the loop coroutines. A
         # task does not run until the scheduler gets to it, so subscribing there
@@ -73,6 +78,12 @@ class Runner:
         # startup it is the whole trade.
         self._raw_sub = self.bus.subscribe(TOPIC_RAW, maxsize=4096, name="classifier")
         self._event_sub = self.bus.subscribe(TOPIC_EVENT, maxsize=2048, name="engine")
+
+        #: Tickers whose stop is enforced by this process rather than the broker.
+        #: Extended-hours orders cannot carry a bracket leg, so if we go down
+        #: with one of these open the position is unprotected. Tracked so
+        #: shutdown can flatten them.
+        self.client_side_stops: set[str] = set()
 
     # -----------------------------------------------------------------
     # sinks
@@ -135,11 +146,30 @@ class Runner:
                 self.counts["signals"] += 1
                 self.bus.publish(TOPIC_SIGNAL, sig)
                 self.on_signal(sig)
+
                 order = self.risk.size_order(sig)
-                if order is not None:
-                    self.counts["orders"] += 1
+                if order is None:
+                    continue
+                self.counts["orders"] += 1
+                self.on_order(order)
+
+                if not (self.cfg.live and self.broker is not None):
+                    # Alert-only: record the intent so the day's log is complete,
+                    # but nothing is at the broker.
                     self.risk.open(order)
-                    self.on_order(order)
+                    continue
+
+                fill = await self.broker.submit(order)
+                if not fill.accepted:
+                    self.counts["rejected"] += 1
+                    log.error("broker rejected %s", fill.describe())
+                    continue
+
+                self.counts["accepted"] += 1
+                log.warning("broker %s", fill.describe())
+                self.risk.open(order)
+                if fill.stop_is_client_side:
+                    self.client_side_stops.add(order.ticker)
 
     async def _quote_loop(self, source: QuoteSource) -> None:
         async for q in source.stream():
@@ -150,8 +180,49 @@ class Runner:
             # Exit checks ride the quote path so a stop is evaluated the instant
             # the price that would trigger it arrives, not on the next timer tick.
             pos = self.risk.positions.get(q.ticker)
-            if pos is not None:
-                self.risk.check_exits({q.ticker: q.mid or q.last})
+            if pos is None:
+                continue
+
+            # Capture before check_exits -- it removes the position on a trigger.
+            direction, shares, sig = pos.direction, pos.shares, pos.signal
+            exits = self.risk.check_exits({q.ticker: q.mid or q.last})
+            if not exits:
+                continue
+
+            # A bracket order's stop already lives at the broker, so firing our
+            # own close would double up. Only client-side stops need us to act.
+            for ticker, px, why in exits:
+                if ticker in self.client_side_stops:
+                    self.client_side_stops.discard(ticker)
+                    if self.cfg.live and self.broker is not None:
+                        await self._close_at_broker(ticker, direction, shares, px, why, sig)
+
+    async def _close_at_broker(self, ticker: str, direction, shares: int,
+                               px: float, why: str, sig: Signal) -> None:
+        """Send the closing leg for a position whose stop we were holding.
+
+        Priced marketably (through the touch) rather than at the trigger price:
+        a resting limit at the stop level in a fast tape does not get filled, and
+        an unfilled stop is not a stop.
+        """
+        from .models import Direction as _D
+        from .signal.risk import Order as _Order
+
+        slip = 0.004  # 40bps through the touch to actually get out
+        exit_dir = _D.SHORT if direction is _D.LONG else _D.LONG
+        limit = px * (1 - slip) if exit_dir is _D.SHORT else px * (1 + slip)
+
+        closing = _Order(
+            ticker=ticker, direction=exit_dir, shares=shares,
+            limit=round(limit, 2), stop=0.0, target=0.0,
+            signal=sig, reason=f"close:{why}",
+        )
+        fill = await self.broker.submit(closing)
+        if fill.accepted:
+            log.warning("CLOSE sent %s (%s) %s", ticker, why, fill.describe())
+        else:
+            log.error("CLOSE FAILED %s (%s): %s -- POSITION MAY STILL BE OPEN",
+                      ticker, why, fill.error)
 
     # -----------------------------------------------------------------
     # feed construction
@@ -220,10 +291,35 @@ class Runner:
         try:
             await self.stop.wait()
         finally:
+            # Order matters: flatten BEFORE tearing down the loop. A position
+            # whose stop lives in this process becomes unprotected the moment
+            # this process exits, so leaving one open on shutdown is strictly
+            # worse than taking the exit at whatever the book offers.
+            await self.protect_on_shutdown()
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await client.aclose()
+
+    async def protect_on_shutdown(self) -> None:
+        if not (self.cfg.live and self.broker is not None):
+            return
+        if not self.client_side_stops:
+            return
+        log.error(
+            "shutting down with %d client-side-stop position(s) open: %s -- "
+            "flattening, because an unprotected position outlives this process",
+            len(self.client_side_stops), ", ".join(sorted(self.client_side_stops)),
+        )
+        try:
+            n = await self.broker.flatten_all()
+            log.warning("flattened %d position(s) at market", n)
+            self.client_side_stops.clear()
+        except Exception as exc:
+            log.critical(
+                "FLATTEN FAILED (%r) -- YOU HAVE OPEN UNPROTECTED POSITIONS. "
+                "Close them manually in the broker UI now.", exc,
+            )
 
     async def _heartbeat(self, every: float = 30.0) -> None:
         while not self.stop.is_set():
