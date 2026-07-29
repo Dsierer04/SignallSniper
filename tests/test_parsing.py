@@ -17,8 +17,8 @@ EDGAR_ATOM = b"""<?xml version="1.0" encoding="ISO-8859-1"?>
     <title>8-K - Apple Inc. (0000320193) (Filer)</title>
     <link rel="alternate" type="text/html"
       href="https://www.sec.gov/Archives/edgar/data/320193/000032019326000077-index.htm"/>
-    <summary type="html">Item 2.02 Results of Operations and Financial Condition.
-      Item 9.01 Financial Statements and Exhibits.</summary>
+    <summary type="html">&lt;b&gt;Filed:&lt;/b&gt; 2026-07-30 &lt;b&gt;AccNo:&lt;/b&gt;
+      0000320193-26-000077 &lt;b&gt;Size:&lt;/b&gt; 1 MB</summary>
     <updated>2026-07-30T16:05:12-04:00</updated>
     <category scheme="https://www.sec.gov/" label="form type" term="8-K"/>
     <id>urn:tag:sec.gov,2008:accession-number=0000320193-26-000077</id>
@@ -77,7 +77,11 @@ class TestEdgarParsing:
         assert aapl.meta["form"] == "8-K"
         assert aapl.meta["cik"] == "320193"
         assert aapl.meta["company"] == "Apple Inc."
-        assert aapl.meta["items"] == ("2.02", "9.01")
+        # The real getcurrent feed carries NO item codes -- only Filed/AccNo/Size.
+        # An earlier parser scanned this summary for them, always found none, and
+        # silently dropped every 8-K below the materiality floor. EdgarEnricher
+        # fetches them from the filing index page instead.
+        assert aapl.meta["items"] == ()
         assert aapl.published is not None
 
     def test_form_from_category_overrides_default(self):
@@ -157,3 +161,76 @@ class TestTickerResolver:
     def test_short_name_does_not_prefix_match(self, resolver):
         # Guard against a 3-char query joining to an unrelated issuer.
         assert resolver.resolve(company="APP") == ""
+
+
+class TestEdgarEnricher:
+    """Item codes come from the filing index page, not the current-filings feed.
+
+    This is the gap that made every 8-K classify on its form prior alone --
+    below the materiality floor, so the engine rejected essentially all of them.
+    """
+
+    INDEX_HTML = """
+    <html><body>
+    <div class="formGrouping">
+      <div class="infoHead">Filing Date</div><div class="info">2026-07-30</div>
+      <div class="infoHead">Items</div>
+      <div class="info">Item 2.02: Results of Operations and Financial Condition<br>
+        Item 9.01: Financial Statements and Exhibits</div>
+    </div>
+    </body></html>
+    """
+
+    def test_parses_items_from_index_page(self):
+        from signalsniper.feeds.edgar import EdgarEnricher
+        assert EdgarEnricher.parse_items(self.INDEX_HTML) == ("2.02", "9.01")
+
+    def test_page_without_items_yields_empty(self):
+        from signalsniper.feeds.edgar import EdgarEnricher
+        assert EdgarEnricher.parse_items("<html><body>no items here</body></html>") == ()
+
+    def test_enriched_doc_now_classifies_as_material(self):
+        """The whole point: without items an earnings 8-K is invisible."""
+        from signalsniper.models import RawDoc
+        from signalsniper.parse.classify import classify_doc
+
+        bare = RawDoc(source="edgar", doc_id="a", title="8-K - Apple Inc.",
+                      url="", published=None,
+                      meta={"form": "8-K", "items": ()})
+        enriched = RawDoc(source="edgar", doc_id="a", title="8-K - Apple Inc.",
+                          url="", published=None,
+                          meta={"form": "8-K", "items": ("2.02", "9.01")})
+
+        # 0.35 generic form prior -- under the engine's 0.40 materiality floor.
+        assert classify_doc(bare).materiality < 0.40
+        # With item 2.02 it is a recognised earnings event.
+        assert classify_doc(enriched).materiality >= 0.80
+
+    @pytest.mark.asyncio
+    async def test_enrich_is_skipped_when_items_already_present(self):
+        from signalsniper.feeds.edgar import EdgarEnricher
+        from signalsniper.models import RawDoc
+
+        enricher = EdgarEnricher(None, TokenBucket(10.0))
+        doc = RawDoc(source="edgar", doc_id="a", title="t",
+                     url="https://example.invalid/x", published=None,
+                     meta={"items": ("2.02",)})
+        assert (await enricher.enrich(doc)).meta["items"] == ("2.02",)
+        assert enricher.fetched == 0
+
+    @pytest.mark.asyncio
+    async def test_enrich_failure_is_non_fatal(self):
+        """A slow or broken index fetch must not stall the pipeline."""
+        from signalsniper.feeds.edgar import EdgarEnricher
+        from signalsniper.models import RawDoc
+
+        class Boom:
+            async def get(self, url):
+                raise RuntimeError("network down")
+
+        enricher = EdgarEnricher(Boom(), TokenBucket(10.0))
+        doc = RawDoc(source="edgar", doc_id="a", title="t",
+                     url="https://example.invalid/x", published=None, meta={})
+        out = await enricher.enrich(doc)
+        assert out is doc
+        assert enricher.failed == 1

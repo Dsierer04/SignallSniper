@@ -45,7 +45,22 @@ _ACCESSION_RE = re.compile(r"(\d{10}-\d{2}-\d{6})")
 #: "NT 10-K") -- splitting on a bare hyphen truncates the form and corrupts the
 #: company name.
 _TITLE_RE = re.compile(r"^\s*(?P<form>.+?)\s+-\s+(?P<name>.+?)\s*\((?P<cik>\d{4,10})\)")
-#: 8-K item codes as they appear in the summary blob, e.g. "Item 2.02".
+#: 8-K item codes, e.g. "Item 2.02".
+#:
+#: IMPORTANT: these do NOT appear in the getcurrent Atom feed. That feed's
+#: <summary> is only "Filed: <date> AccNo: <accession> Size: <n> KB". An earlier
+#: version of this parser scanned the summary for item codes and always found
+#: none, which silently made every 8-K fall back to the generic 0.35 form prior
+#: -- below the 0.40 materiality floor, so the engine would have rejected
+#: essentially every 8-K and the system would have run nearly silent.
+#:
+#: The unit tests did not catch it because the fixture was hand-written with
+#: item codes in the summary: it tested the assumption, not the feed.
+#:
+#: Item codes live on the per-filing index page the entry already links to, so
+#: `EdgarEnricher` fetches that. It costs one extra request per filing of
+#: interest, which is why enrichment is a separate, rate-limited stage rather
+#: than part of the poll.
 _ITEM_RE = re.compile(r"\bItem\s+(\d{1,2}\.\d{2})\b")
 
 
@@ -113,6 +128,9 @@ class EdgarCurrentFeed(PollingFeed):
             if cat.get("label", "").lower() == "form type" and cat.get("term"):
                 form = cat.get("term", form)
 
+        # The getcurrent summary does not carry item codes; scan anyway in case a
+        # future feed shape adds them, but expect () and let EdgarEnricher fill
+        # them in from the filing index page.
         items = tuple(sorted(set(_ITEM_RE.findall(summary + " " + title))))
 
         return RawDoc(
@@ -130,6 +148,68 @@ class EdgarCurrentFeed(PollingFeed):
                 "accession": accession,
             },
         )
+
+
+#: "Items" block on a filing index page:
+#:   <div class="infoHead">Items</div>
+#:   <div class="info">Item 2.02: Results of Operations...<br>Item 9.01: ...</div>
+_INDEX_ITEMS_RE = re.compile(
+    r"Items?\s*</div>\s*<div[^>]*>(.*?)</div>", re.IGNORECASE | re.DOTALL
+)
+
+
+class EdgarEnricher:
+    """Fetches item codes for a filing from its index page.
+
+    Kept out of the polling loop deliberately. The current-filings feed is one
+    cheap conditional GET; enrichment is one request *per filing*, and at 16:05
+    with hundreds of filings landing at once, doing that inline would blow the
+    SEC rate budget and stall the feed. Callers should enrich selectively --
+    filings that resolved to a ticker, or forms where item codes change the
+    classification.
+
+    NOT VERIFIED AGAINST LIVE SEC. The egress policy in the build environment
+    blocks sec.gov, so the index-page shape here comes from documented structure
+    rather than a live fetch. Confirm with `doctor` from a host that can reach
+    sec.gov before relying on it.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, bucket, cost: float = 1.0) -> None:
+        self.client = client
+        self.bucket = bucket
+        self.cost = cost
+        self.fetched = 0
+        self.failed = 0
+
+    @staticmethod
+    def parse_items(html: str) -> tuple[str, ...]:
+        block = _INDEX_ITEMS_RE.search(html)
+        text = block.group(1) if block else html
+        return tuple(sorted(set(_ITEM_RE.findall(text))))
+
+    async def enrich(self, doc: RawDoc) -> RawDoc:
+        """Populate doc.meta['items']. Returns the same doc, mutated.
+
+        Failure is non-fatal: an un-enriched 8-K classifies on its form prior
+        alone, which is weak but not wrong. Blocking the pipeline on a slow
+        index fetch would be worse.
+        """
+        if doc.meta.get("items") or not doc.url:
+            return doc
+        await self.bucket.take(self.cost)
+        try:
+            resp = await self.client.get(doc.url)
+            if resp.status_code >= 400:
+                self.failed += 1
+                return doc
+            items = self.parse_items(resp.text)
+            if items:
+                doc.meta["items"] = items
+            self.fetched += 1
+        except Exception as exc:
+            self.failed += 1
+            log.debug("enrich failed for %s: %r", doc.doc_id, exc)
+        return doc
 
 
 class TickerResolver:

@@ -19,7 +19,7 @@ from .config import Config
 from .execution.broker import Broker, Fill, OrderStatus
 from .execution.session import current_session
 from .feeds.base import TokenBucket, build_client
-from .feeds.edgar import EdgarCurrentFeed, TickerResolver
+from .feeds.edgar import EdgarCurrentFeed, EdgarEnricher, TickerResolver
 from .feeds.newswire import PUBLIC_WIRES, RssFeed
 from .market.linkage import LinkageGraph
 from .market.quotes import QuoteSource
@@ -62,6 +62,7 @@ class Runner:
             max_daily_loss_frac=cfg.max_daily_loss,
             max_concurrent=cfg.max_concurrent,
         ))
+        self.enricher: EdgarEnricher | None = None
         self.on_signal = on_signal or self._default_signal_sink
         self.on_order = on_order or self._default_order_sink
         self.stop = asyncio.Event()
@@ -132,6 +133,16 @@ class Runner:
             doc: RawDoc = await sub.get()
             self.counts["docs"] += 1
             tickers = self.tickers_for(doc)
+
+            # Item codes are not in the current-filings feed -- they live on the
+            # per-filing index page. Fetch them only once the doc has resolved to
+            # a ticker we care about, so the 16:05 flood of unrelated filings
+            # does not spend the SEC rate budget.
+            if (self.enricher is not None and doc.source == "edgar"
+                    and tickers and not doc.meta.get("items")
+                    and str(doc.meta.get("form", "")).startswith("8-K")):
+                doc = await self.enricher.enrich(doc)
+
             event = build_event(doc, tickers)
             if event.materiality <= 0.0 and not tickers:
                 continue
@@ -319,6 +330,7 @@ class Runner:
                 label=label, tickers=tickers,
             ))
 
+        self.enricher = EdgarEnricher(client, sec_bucket)
         self.feeds = feeds
         return feeds
 
