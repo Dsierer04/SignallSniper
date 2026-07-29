@@ -22,7 +22,7 @@ from typing import Any, Iterable
 import httpx
 
 from ..bus import TOPIC_HEALTH, TOPIC_RAW, EventBus
-from ..models import RawDoc, now_ns
+from ..models import RawDoc, mono_ns
 
 log = logging.getLogger("signalsniper.feeds")
 
@@ -139,7 +139,7 @@ class PollingFeed:
             headers["If-Modified-Since"] = self._last_modified
 
         await self.bucket.take(self.cost)
-        t0 = now_ns()
+        t0 = mono_ns()
         try:
             resp = await self.client.get(self.url, headers=headers)
         except Exception as exc:  # network flap -- back off, never die
@@ -150,7 +150,7 @@ class PollingFeed:
             return []
 
         self.stats.polls += 1
-        self.stats.record_latency((now_ns() - t0) / 1e6)
+        self.stats.record_latency((mono_ns() - t0) / 1e6)
         self._backoff = 0.0
 
         if resp.status_code == 304:
@@ -169,7 +169,7 @@ class PollingFeed:
         self._etag = resp.headers.get("etag") or self._etag
         self._last_modified = resp.headers.get("last-modified") or self._last_modified
         self.stats.changed += 1
-        self.stats.last_ok_ns = now_ns()
+        self.stats.last_ok_ns = mono_ns()
 
         fresh: list[RawDoc] = []
         try:

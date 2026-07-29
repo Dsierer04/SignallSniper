@@ -20,7 +20,7 @@ import statistics
 from collections import deque
 from dataclasses import dataclass, field
 
-from ..models import Quote, now_ns
+from ..models import Quote, epoch_ns, mono_ns
 
 
 @dataclass(slots=True)
@@ -165,7 +165,7 @@ class TickerTape:
         """Stdev of per-tick returns over the window, in bps. The unit of 'normal'."""
         if len(self._px) < 3:
             return 0.0
-        cutoff = now_ns() - int(lookback_s * 1e9)
+        cutoff = epoch_ns() - int(lookback_s * 1e9)
         start = bisect.bisect_left(self._t, cutoff)
         px = self._px[start:]
         if len(px) < 3:
@@ -186,7 +186,7 @@ class TickerTape:
         """Recent volume rate over baseline rate. >3 means something is happening."""
         if not self._vol_buckets:
             return 0.0
-        now_b = int(now_ns() // int(self._bucket_s * 1e9))
+        now_b = int(epoch_ns() // int(self._bucket_s * 1e9))
         win_b = int(window_s / self._bucket_s)
         base_b = int(baseline_s / self._bucket_s)
         recent = sum(v for b, v in self._vol_buckets if b > now_b - win_b)

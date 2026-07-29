@@ -88,20 +88,20 @@ async def cmd_demo(args) -> int:
     """Offline end-to-end proof: synthetic AAPL drop -> CRUS/SWKS dislocation."""
     from .market.quotes import synth_walk
     from .market.tape import MarketState
-    from .models import RawDoc, now_ns
+    from .models import RawDoc, epoch_ns, mono_ns
     from .parse.classify import build_event
     from .signal.engine import DEFAULT_MOVE_SCALE, EngineConfig, SignalEngine
     from .signal.risk import RiskConfig, RiskManager
 
     market = MarketState()
-    t0 = now_ns()
+    t0 = epoch_ns()
 
     # Pre-event baseline so the tapes have history to reference.
     for tick, px in [("AAPL", 232.0), ("CRUS", 104.0), ("SWKS", 78.0), ("QRVO", 92.0)]:
         for q in synth_walk(tick, px, 40, t0 - 40 * 100_000_000, drift_bps_total=0.0):
             market.on_quote(q)
 
-    event_ns = now_ns()
+    event_ns = epoch_ns()
     doc = RawDoc(
         source="edgar",
         doc_id="0000320193-26-000077",
@@ -115,6 +115,7 @@ async def cmd_demo(args) -> int:
               "items": ("2.02", "7.01")},
     )
     doc.t_ingest = event_ns
+    doc.t_mono = mono_ns()
 
     # AAPL reprices hard and instantly. The suppliers barely move -- that is the
     # dislocation the engine is built to find.
@@ -350,15 +351,31 @@ async def cmd_flatten(args) -> int:
     """The panic button. Cancels every open order, closes every position."""
     from .execution.broker import AlpacaBroker
 
+    import os
+
     cfg = load()
     if not (cfg.alpaca_key and cfg.alpaca_secret):
         print("no Alpaca credentials configured")
         return 1
 
+    # ALPACA_PAPER defaults to True when unset, so a panic run from a shell that
+    # is missing the variable would flatten the PAPER account, print "flat.",
+    # and leave real positions open. On the panic button that is the worst
+    # possible failure, so refuse to guess.
+    if os.getenv("ALPACA_PAPER") is None:
+        print("ALPACA_PAPER is not set in this shell.")
+        print("Refusing to guess which account to flatten -- set it explicitly:")
+        print("  ALPACA_PAPER=false python3 -m signalsniper flatten   # live")
+        print("  ALPACA_PAPER=true  python3 -m signalsniper flatten   # paper")
+        return 1
+
     broker = AlpacaBroker(cfg.alpaca_key, cfg.alpaca_secret, paper=cfg.alpaca_paper)
     try:
         mode = "PAPER" if cfg.alpaca_paper else "*** LIVE ***"
-        print(f"[{mode}] cancelling orders and closing positions...")
+        acct = await broker.account()
+        print(f"[{mode}] account {acct.account_number}  equity ${acct.equity:,.2f}")
+        before = await broker.positions()
+        print(f"[{mode}] {len(before)} open position(s); cancelling and closing...")
         cancelled = await broker.cancel_all()
         closed = await broker.flatten_all()
         print(f"  cancelled {cancelled} order(s)")

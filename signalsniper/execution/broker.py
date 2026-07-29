@@ -39,6 +39,14 @@ PAPER_BASE = "https://paper-api.alpaca.markets"
 LIVE_BASE = "https://api.alpaca.markets"
 
 
+def to_broker_symbol(ticker: str) -> str:
+    """SEC's ticker file uses hyphens for share classes (BRK-B, BF-B, HEI-A);
+    Alpaca expects dots (BRK.B). Passing the SEC form straight through produces
+    an order for a symbol that does not exist, which the broker rejects -- so
+    the failure is loud, but only after the moment has passed."""
+    return ticker.strip().upper().replace("-", ".")
+
+
 @dataclass(slots=True)
 class Fill:
     """Result of a submission. `accepted` means the broker took it, not that it filled."""
@@ -260,7 +268,7 @@ class AlpacaBroker:
         # of the two since it matches the docs and never loses precision.
         # Short orders must be whole shares -- fractional shorting is rejected.
         payload: dict[str, Any] = {
-            "symbol": order.ticker,
+            "symbol": to_broker_symbol(order.ticker),
             "qty": str(order.shares),
             "side": side,
             "type": "limit",
@@ -279,6 +287,10 @@ class AlpacaBroker:
             # Extended hours: Alpaca rejects bracket/OCO here. Limit only.
             payload["extended_hours"] = True
             client_side_stop = True
+            # NOTE: time_in_force stays "day", so this order dies at the 20:00
+            # extended-hours close. An unfilled protective exit therefore ceases
+            # to exist exactly when the session ends -- the runner must flatten
+            # before 20:00 rather than rely on a resting order surviving it.
             log.warning(
                 "%s submitted in %s WITHOUT a broker-side stop -- the stop at "
                 "%.2f is enforced by this process only. If it dies, you are naked.",

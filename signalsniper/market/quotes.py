@@ -21,7 +21,7 @@ import logging
 from datetime import datetime
 from typing import AsyncIterator, Iterable, Protocol
 
-from ..models import Quote, now_ns
+from ..models import Quote, epoch_ns
 
 log = logging.getLogger("signalsniper.quotes")
 
@@ -35,7 +35,7 @@ def _parse_rfc3339_ns(raw: str) -> int:
     try:
         return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() * 1e9)
     except (ValueError, AttributeError):
-        return now_ns()
+        return epoch_ns()
 
 
 class AlpacaQuoteStream:
@@ -117,7 +117,17 @@ class AlpacaQuoteStream:
                     await ws.send(json.dumps(
                         {"action": "auth", "key": self.key, "secret": self.secret}
                     ))
-                    await ws.recv()  # auth ack
+                    # Alpaca sends [{"T":"success","msg":"connected"}] FIRST and
+                    # the authenticated ack second. A single recv() consumes the
+                    # connect frame and never checks auth at all -- so a wrong
+                    # key produces a socket that connects, yields no quotes, and
+                    # looks exactly like a quiet market. Read until we see the
+                    # authenticated ack or an explicit error.
+                    if not await self._await_auth(ws):
+                        raise RuntimeError(
+                            "alpaca auth failed -- check ALPACA_API_KEY / "
+                            "ALPACA_SECRET_KEY and whether they are paper or live keys"
+                        )
                     # Re-subscribe the FULL current set on every (re)connect,
                     # including anything added mid-stream. A reconnect that
                     # restored only the original watchlist would silently drop
@@ -144,6 +154,30 @@ class AlpacaQuoteStream:
                 log.warning("alpaca stream dropped: %r; reconnecting in %.1fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(15.0, backoff * 2)
+
+    async def _await_auth(self, ws, max_frames: int = 5) -> bool:
+        """True once the venue confirms authentication."""
+        for _ in range(max_frames):
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+            except (asyncio.TimeoutError, Exception):
+                return False
+            try:
+                payload = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(payload, dict):
+                payload = [payload]
+            for msg in payload:
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("T") == "error":
+                    log.error("alpaca auth error %s: %s",
+                              msg.get("code"), msg.get("msg"))
+                    return False
+                if msg.get("T") == "success" and msg.get("msg") == "authenticated":
+                    return True
+        return False
 
     def _decode(self, raw: str | bytes) -> list[Quote]:
         try:

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from ..models import Direction, Signal, now_ns
+from ..models import Direction, Signal, mono_ns
 
 log = logging.getLogger("signalsniper.risk")
 
@@ -120,7 +120,7 @@ class Position:
     stop: float
     target: float
     signal: Signal
-    opened_ns: int = field(default_factory=now_ns)
+    opened_ns: int = field(default_factory=mono_ns)
 
     def unrealized(self, price: float) -> float:
         return (price - self.entry) * self.shares * self.direction.value
@@ -169,14 +169,29 @@ class RiskManager:
     def daily_loss_limit(self) -> float:
         return -abs(self.cfg.equity * self.cfg.max_daily_loss_frac)
 
-    def check_kill_switch(self) -> bool:
-        """True when trading is halted. Sticky: only `resume()` clears it."""
+    def check_kill_switch(self, prices: dict[str, float] | None = None) -> bool:
+        """True when trading is halted. Sticky: only `resume()` clears it.
+
+        Counts UNREALIZED loss when prices are supplied. Reading realized P&L
+        alone cannot see the loss that actually blows an account: several
+        positions opened off the same event are the same bet, they move
+        together, and while they are all open the realized figure is still zero.
+        The switch would sit at zero right through the drawdown and only fire
+        after the damage was booked.
+        """
         if self.halted:
             return True
-        if self.realized_pnl <= self.daily_loss_limit:
+
+        total = self.realized_pnl
+        if prices:
+            total += sum(p.unrealized(prices.get(t, p.entry))
+                         for t, p in self.positions.items())
+
+        if total <= self.daily_loss_limit:
             self.halted = True
+            kind = "total (incl. open)" if prices else "realized"
             self.halt_reason = (
-                f"daily loss {self.realized_pnl:,.0f} hit limit {self.daily_loss_limit:,.0f}"
+                f"{kind} P&L {total:,.2f} hit limit {self.daily_loss_limit:,.2f}"
             )
             log.error("KILL SWITCH: %s", self.halt_reason)
             return True
@@ -216,7 +231,7 @@ class RiskManager:
             return None
 
         last_exit = self.last_exit_ns.get(signal.ticker)
-        if last_exit is not None and (now_ns() - last_exit) / 1e9 < cfg.cooldown_s:
+        if last_exit is not None and (mono_ns() - last_exit) / 1e9 < cfg.cooldown_s:
             self._reject("cooldown")
             return None
 
@@ -315,14 +330,42 @@ class RiskManager:
             return 0.0
         pnl = pos.unrealized(price)
         self.realized_pnl += pnl
-        self.last_exit_ns[ticker] = now_ns()
+        self.last_exit_ns[ticker] = mono_ns()
         log.info("CLOSE %s @ %.2f pnl=%+.2f (%s) day=%+.2f",
                  ticker, price, pnl, why, self.realized_pnl)
         self.check_kill_switch()
         return pnl
 
+    def pending_exits(self, prices: dict[str, float]) -> list[tuple[str, float, str]]:
+        """Which positions have triggered, WITHOUT mutating anything.
+
+        Separated from `close()` so a caller that must send an order can send it
+        first and only book the exit once the broker accepts. Booking the fill
+        before the order exists deletes the position from our memory while it is
+        still live at the broker -- an untracked, unstopped position that nothing
+        will ever close.
+        """
+        out: list[tuple[str, float, str]] = []
+        for ticker, pos in self.positions.items():
+            px = prices.get(ticker)
+            if px is None or px <= 0:
+                continue
+            if pos.direction is Direction.LONG:
+                if px <= pos.stop:
+                    out.append((ticker, px, "stop"))
+                elif px >= pos.target:
+                    out.append((ticker, px, "target"))
+            else:
+                if px >= pos.stop:
+                    out.append((ticker, px, "stop"))
+                elif px <= pos.target:
+                    out.append((ticker, px, "target"))
+        return out
+
     def check_exits(self, prices: dict[str, float]) -> list[tuple[str, float, str]]:
-        """Stops and targets. Call this on every quote batch, not on a timer."""
+        """Stops and targets, booked immediately. Only safe when nothing has to
+        be sent to a broker -- i.e. alert-only, or a broker-side bracket that has
+        already done the closing for us."""
         exits: list[tuple[str, float, str]] = []
         for ticker, pos in list(self.positions.items()):
             px = prices.get(ticker)

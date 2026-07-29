@@ -24,7 +24,7 @@ from .feeds.newswire import PUBLIC_WIRES, RssFeed
 from .market.linkage import LinkageGraph
 from .market.quotes import QuoteSource
 from .market.tape import MarketState
-from .models import Event, Quote, RawDoc, Signal, now_ns
+from .models import Event, Quote, RawDoc, Signal, mono_ns
 from .parse.classify import build_event
 from .signal.engine import DEFAULT_MOVE_SCALE, EngineConfig, SignalEngine
 from .signal.risk import Order, RiskConfig, RiskManager
@@ -79,7 +79,7 @@ class Runner:
         self._watch = {t.upper() for t in cfg.watchlist}
         self.counts = {"docs": 0, "events": 0, "signals": 0, "orders": 0,
                        "accepted": 0, "rejected": 0, "unfilled": 0,
-                       "subscribed": 0}
+                       "subscribed": 0, "adopted": 0}
 
         # Subscribe eagerly at construction, not inside the loop coroutines. A
         # task does not run until the scheduler gets to it, so subscribing there
@@ -227,19 +227,94 @@ class Runner:
             if pos is None:
                 continue
 
-            # Capture before check_exits -- it removes the position on a trigger.
-            direction, shares, sig = pos.direction, pos.shares, pos.signal
-            exits = self.risk.check_exits({q.ticker: q.mid or q.last})
-            if not exits:
+            # Evaluate exits against the TAPE, not the raw quote. The tape holds
+            # a two-tick outlier confirmation gate; reading q.mid directly walks
+            # straight past it, so one bad print fires a real stop and sends a
+            # real order. The gate is worthless if the exit path does not use it.
+            tape = self.market.tapes.get(q.ticker)
+            px = tape.last if tape is not None and tape.last > 0 else 0.0
+            if px <= 0:
                 continue
 
-            # A bracket order's stop already lives at the broker, so firing our
-            # own close would double up. Only client-side stops need us to act.
-            for ticker, px, why in exits:
-                if ticker in self.client_side_stops:
+            # Unrealized P&L must reach the kill switch: several positions opened
+            # off one event are one bet, and while they are all open the realized
+            # figure is still zero.
+            marks = {t: (self.market.tapes[t].last
+                         if t in self.market.tapes and self.market.tapes[t].last > 0
+                         else p.entry)
+                     for t, p in self.risk.positions.items()}
+            if self.risk.check_kill_switch(marks):
+                await self._panic_flatten("kill switch tripped on total P&L")
+                continue
+
+            triggered = self.risk.pending_exits({q.ticker: px})
+            for ticker, trigger_px, why in triggered:
+                if ticker not in self.client_side_stops:
+                    # A broker-side bracket already closed this; just book it.
+                    self.risk.close(ticker, trigger_px, why)
+                    continue
+
+                # Our stop, our responsibility: send the order FIRST and only
+                # book the exit once the broker accepts it. Booking first would
+                # delete a still-live position from our memory.
+                p2 = self.risk.positions.get(ticker)
+                if p2 is None:
+                    continue
+                sent = True
+                if self.cfg.live and self.broker is not None:
+                    sent = await self._close_at_broker(
+                        ticker, p2.direction, p2.shares, trigger_px, why, p2.signal)
+                if sent:
                     self.client_side_stops.discard(ticker)
-                    if self.cfg.live and self.broker is not None:
-                        await self._close_at_broker(ticker, direction, shares, px, why, sig)
+                    self.risk.close(ticker, trigger_px, why)
+                else:
+                    log.critical(
+                        "%s hit its %s at %.2f but the closing order was REJECTED "
+                        "-- position is STILL OPEN and unprotected. Close it "
+                        "manually now.", ticker, why, trigger_px)
+
+    async def adopt_broker_positions(self) -> int:
+        """Pull existing broker positions into the risk manager on startup.
+
+        Adopted positions get NO stop and NO target -- we do not know what thesis
+        opened them or where its stop was, and inventing one would be worse than
+        admitting we cannot manage them. They are logged loudly and counted
+        against max_concurrent so the system does not pile new risk on top of
+        risk it cannot see. Close them manually or with `flatten`.
+        """
+        if self.broker is None or not hasattr(self.broker, "positions"):
+            return 0
+        try:
+            open_positions = await self.broker.positions()
+        except Exception as exc:
+            log.error("could not read existing broker positions (%r) -- if you "
+                      "restarted with positions open, they are UNMANAGED", exc)
+            return 0
+        if not open_positions:
+            return 0
+
+        log.critical(
+            "STARTUP: %d position(s) already open at the broker. These were not "
+            "opened by this process, so their stops are unknown and this system "
+            "CANNOT manage them: %s",
+            len(open_positions),
+            ", ".join(str(p.get("symbol")) for p in open_positions),
+        )
+        log.critical("Close them manually, or run: python3 -m signalsniper flatten")
+        self.counts["adopted"] = len(open_positions)
+        return len(open_positions)
+
+    async def _panic_flatten(self, reason: str) -> None:
+        """Flatten everything at the broker. Used when the kill switch trips."""
+        log.critical("PANIC FLATTEN: %s", reason)
+        if not (self.cfg.live and self.broker is not None):
+            return
+        try:
+            n = await self.broker.flatten_all()
+            log.critical("flattened %d position(s)", n)
+            self.client_side_stops.clear()
+        except Exception as exc:
+            log.critical("FLATTEN FAILED (%r) -- close positions manually NOW", exc)
 
     async def _reconcile(self, order: Order, broker_order_id: str,
                          timeout_s: float = 45.0, poll_s: float = 1.5) -> None:
@@ -254,9 +329,9 @@ class Runner:
         if not broker_order_id or self.broker is None:
             return
 
-        deadline = now_ns() + int(timeout_s * 1e9)
+        deadline = mono_ns() + int(timeout_s * 1e9)
         last: Fill | None = None
-        while now_ns() < deadline:
+        while mono_ns() < deadline:
             await asyncio.sleep(poll_s)
             status = await self.broker.order_status(broker_order_id)
 
@@ -293,6 +368,14 @@ class Runner:
                     order.ticker, timeout_s)
         await self.broker.cancel_order(broker_order_id)
         final = await self.broker.order_status(broker_order_id)
+        if final.status == "unknown":
+            # A transient API error is not evidence of no fill. Dropping the
+            # position here would leave a real one untracked and unstopped;
+            # keeping a phantom one merely blocks a slot. Keep it and shout.
+            log.critical(
+                "%s: cannot determine fill status -- keeping the position and "
+                "assuming it is REAL. Verify in the broker UI.", order.ticker)
+            return
         if final.got_nothing:
             self.risk.drop_unfilled(order.ticker)
             self.client_side_stops.discard(order.ticker)
@@ -302,7 +385,7 @@ class Runner:
                                  final.filled_avg_price or order.limit)
 
     async def _close_at_broker(self, ticker: str, direction, shares: int,
-                               px: float, why: str, sig: Signal) -> None:
+                               px: float, why: str, sig: Signal) -> bool:
         """Send the closing leg for a position whose stop we were holding.
 
         Priced marketably (through the touch) rather than at the trigger price:
@@ -312,7 +395,15 @@ class Runner:
         from .models import Direction as _D
         from .signal.risk import Order as _Order
 
-        slip = 0.004  # 40bps through the touch to actually get out
+        # Cross by the wider of 40bps and a full spread. A fixed 40bps only
+        # reaches the far side while the quoted spread is under 80bps; on a
+        # 300bps after-hours book the "protective" limit rests inside the spread
+        # and never fills, which is not a stop at all.
+        tape = self.market.tapes.get(ticker)
+        spread_bps = tape.spread_bps() if tape is not None else float("inf")
+        if not (spread_bps < 10_000.0):
+            spread_bps = 100.0
+        slip = max(0.004, spread_bps / 10_000.0)
         exit_dir = _D.SHORT if direction is _D.LONG else _D.LONG
         limit = px * (1 - slip) if exit_dir is _D.SHORT else px * (1 + slip)
 
@@ -324,9 +415,9 @@ class Runner:
         fill = await self.broker.submit(closing)
         if fill.accepted:
             log.warning("CLOSE sent %s (%s) %s", ticker, why, fill.describe())
-        else:
-            log.error("CLOSE FAILED %s (%s): %s -- POSITION MAY STILL BE OPEN",
-                      ticker, why, fill.error)
+            return True
+        log.error("CLOSE FAILED %s (%s): %s", ticker, why, fill.error)
+        return False
 
     # -----------------------------------------------------------------
     # feed construction
@@ -382,6 +473,14 @@ class Runner:
             log.info("loaded %d CIK->ticker mappings", n)
         except Exception as exc:
             log.error("ticker map load failed (%r) -- EDGAR attribution degraded", exc)
+
+        # Adopt anything already open at the broker BEFORE starting the feeds.
+        # There is no state persistence, so a restart otherwise leaves live
+        # positions completely unmanaged: RiskManager believes it is flat, no
+        # stop is ever evaluated for them, and protect_on_shutdown will not
+        # flatten them because client_side_stops is empty. A restart at 16:04 on
+        # an earnings day would silently orphan every position you hold.
+        await self.adopt_broker_positions()
 
         self.build_feeds(client, ir_feeds)
 

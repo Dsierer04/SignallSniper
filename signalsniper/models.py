@@ -15,9 +15,42 @@ from enum import Enum
 from typing import Any
 
 
-def now_ns() -> int:
-    """Monotonic clock for latency math. Never wall time -- NTP steps ruin deltas."""
+def mono_ns() -> int:
+    """Monotonic clock, for DURATIONS measured inside this process.
+
+    Latency, signal age, position age, cooldowns. Never wall time for these --
+    an NTP step mid-session would corrupt every delta.
+    """
     return time.monotonic_ns()
+
+
+def epoch_ns() -> int:
+    """Wall-clock nanoseconds since the Unix epoch, for EVENT TIMES.
+
+    Anything compared across sources must use this. A venue timestamps a quote
+    in epoch nanoseconds; if we stamp the filing that quote is compared against
+    with a monotonic clock, the two live in different number spaces (monotonic
+    is ~5e12 seconds-since-boot, epoch is ~1.8e18) and every comparison silently
+    returns garbage.
+
+    That exact bug shipped here: `move_bps_since(t_event)` bisected a tape full
+    of epoch stamps with a monotonic event time, found index -1 every single
+    time, and returned the OLDEST price in the tape as the reference. The whole
+    "how much is already priced in" gate was computed against a stale price on
+    every event. All 236 tests passed because the fixtures built tapes from the
+    same monotonic clock they stamped events with -- the mismatch only existed
+    once a real venue quote entered the tape.
+
+    THE RULE: cross-source comparison -> epoch_ns(). In-process duration ->
+    mono_ns(). Do not mix them, and do not add a timestamp field without
+    deciding which of the two it is.
+    """
+    return time.time_ns()
+
+
+#: Backwards-compatible alias. Prefer the explicit names above -- the ambiguity
+#: of "now" is what allowed the two clocks to be mixed in the first place.
+now_ns = mono_ns
 
 
 def utc_now() -> datetime:
@@ -76,7 +109,11 @@ class RawDoc:
     published: datetime | None
     body: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
-    t_ingest: int = field(default_factory=now_ns)
+    #: EVENT TIME, epoch ns. This is compared against quote timestamps, so it
+    #: must share their clock. See epoch_ns() for why this is not monotonic.
+    t_ingest: int = field(default_factory=epoch_ns)
+    #: The same instant on the monotonic clock, for latency deltas only.
+    t_mono: int = field(default_factory=mono_ns)
 
 
 @dataclass(slots=True)
@@ -90,11 +127,14 @@ class Event:
     prior: Direction  # sign we expect before looking at price
     confidence: float  # 0..1 -- how sure the classifier is
     reasons: tuple[str, ...] = ()
-    t_classified: int = field(default_factory=now_ns)
+    #: Monotonic -- paired with doc.t_mono, never with doc.t_ingest.
+    t_classified: int = field(default_factory=mono_ns)
 
     @property
     def ingest_latency_us(self) -> float:
-        return (self.t_classified - self.doc.t_ingest) / 1_000.0
+        # Monotonic minus monotonic. Subtracting t_ingest (epoch) here would
+        # produce a number ~1.8e18 microseconds and look like nothing at all.
+        return (self.t_classified - self.doc.t_mono) / 1_000.0
 
     @property
     def primary(self) -> str:
@@ -108,7 +148,8 @@ class Quote:
     ask: float
     last: float
     volume: int = 0
-    t_source: int = field(default_factory=now_ns)
+    #: EVENT TIME, epoch ns -- as stamped by the venue.
+    t_source: int = field(default_factory=epoch_ns)
 
     @property
     def mid(self) -> float:
@@ -137,11 +178,14 @@ class Signal:
     ref_price: float = 0.0
     notes: tuple[str, ...] = ()
     ttl_s: float = 300.0
-    t_emit: int = field(default_factory=now_ns)
+    #: Monotonic -- age and expiry are in-process durations.
+    t_emit: int = field(default_factory=mono_ns)
+    #: Monotonic snapshot of the event, so latency stays a monotonic delta.
+    t_event_mono: int = 0
 
     @property
     def age_s(self) -> float:
-        return (now_ns() - self.t_emit) / 1e9
+        return (mono_ns() - self.t_emit) / 1e9
 
     @property
     def expired(self) -> bool:
@@ -149,8 +193,8 @@ class Signal:
 
     @property
     def total_latency_ms(self) -> float:
-        """Wire-to-decision. This is the number that matters."""
-        return (self.t_emit - self.event.doc.t_ingest) / 1e6
+        """Wire-to-decision. Monotonic minus monotonic."""
+        return (self.t_emit - self.event.doc.t_mono) / 1e6
 
     def describe(self) -> str:
         arrow = {Direction.LONG: "LONG", Direction.SHORT: "SHORT", Direction.NEUTRAL: "FLAT"}[
