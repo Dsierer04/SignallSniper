@@ -61,7 +61,12 @@ trade. The same event thirty seconds later is somebody else's exit liquidity.
 
 ## Quick start
 
+**On macOS, `pip` is not aliased — use a virtualenv (see
+[docs/MACOS_SETUP.md](docs/MACOS_SETUP.md) for the full copy/paste path,
+including the Python 3.10+ requirement and keeping the machine awake).**
+
 ```bash
+python3 -m venv .venv && source .venv/bin/activate   # then plain `pip` works
 pip install -r requirements.txt
 export SEC_USER_AGENT="Your Name you@example.com"   # SEC requires this; anonymous polling gets blocked
 
@@ -109,6 +114,8 @@ risk manager still gets the final veto.
 
 ## Docs
 
+- **[docs/MACOS_SETUP.md](docs/MACOS_SETUP.md)** — macOS copy/paste setup:
+  Python version, virtualenv, keys, and keeping the machine awake
 - **[docs/GO_LIVE.md](docs/GO_LIVE.md)** — how to actually get this running,
   what you have to do yourself, and why the sequencing matters
 - **[docs/RUNBOOK_2026-07-30.md](docs/RUNBOOK_2026-07-30.md)** — the plan for
