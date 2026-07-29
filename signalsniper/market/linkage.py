@@ -1,29 +1,47 @@
-"""Second-order propagation graph -- the actual edge in this system.
+"""Second-order propagation graph.
 
-When AAPL prints at 16:05, AAPL itself reprices in milliseconds and you will
-never be in front of that. But Cirrus Logic, which books ~90% of its revenue from
-Apple, does *not* reprice in milliseconds. It reprices when a human thinks
-"Services beat, iPhone units light -- what does that mean for the audio codec
-supplier?" That thought takes minutes, and it is thin after hours.
+READ THIS BEFORE TRUSTING ANYTHING BELOW.
 
-That gap is the trade. This module encodes the map so the thought is precomputed.
+This module was built on the thesis that when a mega cap prints, its
+economically-linked names reprice on a lag of MINUTES, because the read-through
+requires human inference. A literature review refuted that at this timescale:
 
-Two design points that make this better than a naive correlation table:
+  * Cohen & Frazzini (2008) and Menzly & Ozbas (2010) -- the papers the thesis
+    leans on -- are MONTHLY-rebalance, monthly-holding studies (~150bp/month).
+    Neither contains daily analysis, let alone intraday.
+  * C&F's own mechanism evidence points the wrong way: the predictability
+    concentrates around the LINKED firm's own subsequent earnings announcement,
+    not in the minutes after the primary's.
+  * The high-frequency work that does measure seconds-scale behaviour finds
+    linked-firm repricing is same-session and effectively simultaneous, driven
+    by machines and by sector-ETF arbitrage that propagates mechanically.
+  * The delayed-participant window collapsed from ~10 seconds (pre-2016) to
+    roughly zero.
+
+So the "human inference bottleneck" this graph was built to exploit has largely
+been automated away. The structure is kept because it is still the right shape
+for a *measured* edge -- but every link is now a hypothesis to be tested by
+`tools/validate.py`, not a claim to trade on. `lag_capture` is None on all of
+them, `Link.verified` is False, and the engine discounts them accordingly.
+
+Two design points that remain sound:
 
 1. **Channels.** An event is not a scalar. An AAPL Services beat should propagate
    to the app-economy and to Google (TAC), and should *not* propagate to RF
-   front-end suppliers. Edges are tagged by channel and only fire when the event
-   actually touched that channel.
+   front-end suppliers. Edges only fire when the event touched their channel.
 
-2. **Polarity.** Some links are inverse. AMZN crushing retail is bad for SHOP's
-   merchant story and bad for FDX/UPS parcel volume. Those inverse edges are
-   where the least competition is, because the reflexive trade is to buy
-   everything adjacent to a winner.
+2. **Polarity.** Some links are genuinely inverse -- Amazon's advertising
+   strength is a headwind for The Trade Desk. But note that the *original*
+   inverse edges here (SHOP, ETSY, W, TGT on retail) were empirically backwards:
+   SHOP-AMZN correlation is POSITIVE at every horizon (+0.45 3m, +0.42 1y,
+   +0.59 5y). Consumer-discretionary and market beta dominate competitive
+   substitution. A hard-coded inverse beta there would have lost systematically.
+   That is exactly the kind of plausible-sounding link that fact-checking kills.
 
 Betas are read-through sensitivity, not price correlation: "if the primary moves
-1%, how much of that is *attributable* to this name's exposure". They are
-starting priors from public revenue-concentration disclosures. Calibrate them
-against your own fills.
+1%, how much of that is attributable to this name's exposure". Every one below
+has been checked against the most recent 10-K customer-concentration disclosure;
+the removals are recorded inline so they are not casually re-added.
 """
 
 from __future__ import annotations
@@ -96,64 +114,113 @@ CH_RATES = "rates"
 
 LINKS: list[Link] = [
     # --- Apple hardware supply chain ---------------------------------------
-    Link("AAPL", "CRUS", 0.85, CH_IPHONE, 1, 90, "~90% of revenue from Apple audio codecs"),
-    Link("AAPL", "SWKS", 0.70, CH_IPHONE, 1, 90, "~65-70% Apple RF front-end"),
-    Link("AAPL", "QRVO", 0.55, CH_IPHONE, 1, 100, "~45% Apple RF"),
-    Link("AAPL", "LITE", 0.35, CH_IPHONE, 1, 150, "VCSEL arrays for Face ID"),
-    Link("AAPL", "COHR", 0.25, CH_IPHONE, 1, 180, "optical/laser content"),
-    Link("AAPL", "GLW", 0.30, CH_IPHONE, 1, 150, "cover glass, ~25% Apple"),
-    Link("AAPL", "JBL", 0.25, CH_IPHONE, 1, 180, "contract manufacturing"),
-    Link("AAPL", "QCOM", 0.25, CH_IPHONE, 1, 120, "modem, declining share"),
-    Link("AAPL", "AVGO", 0.20, CH_IPHONE, 1, 120, "RF + wireless combo"),
-    Link("AAPL", "TXN", 0.10, CH_IPHONE, 1, 240, "diversified analog, thin read"),
-    Link("AAPL", "FN", 0.15, CH_IPHONE, 1, 210, "optical contract manufacturing"),
+    # Betas below were fact-checked against the most recent 10-K customer
+    # concentration disclosures. Five of the original eleven were refuted
+    # outright and removed; the table had been calibrated around 2021-2023 and
+    # missed the AI/datacom re-rating that now drives LITE, COHR, FN and AVGO.
+    Link("AAPL", "CRUS", 0.85, CH_IPHONE, 1, 90,
+         "~90% of revenue from Apple audio codecs (10-K confirmed)"),
+    Link("AAPL", "SWKS", 0.65, CH_IPHONE, 1, 90,
+         "~65-68% Apple FY2025 (10-K); content share declining, trend not static"),
+    Link("AAPL", "GLW", 0.15, CH_IPHONE, 1, 150,
+         "Apple ~10-16%, not the ~25% previously assumed; Optical Comms (38% of "
+         "segment sales) dominates the stock"),
+    Link("AAPL", "COHR", 0.10, CH_IPHONE, 1, 180,
+         "Apple VCSEL agreement is real but Datacenter & Comms is ~65% of revenue; "
+         "trades on AI datacom, not Apple"),
+    Link("AAPL", "TXN", 0.10, CH_IPHONE, 1, 240,
+         "diversified analog, thin read (confirmed)"),
+
+    # REMOVED after fact-check, kept here as a record so they are not re-added:
+    #   QRVO  Apple is 50% of revenue (FY2026 10-K, higher than the 45% assumed),
+    #         but the name is pinned by a pending merger. A merger-arb target does
+    #         not respond to Apple headlines with a supply-chain beta.
+    #   LITE  Apple is under 10% and shrinking. The whole Industrial Tech segment
+    #         (all VCSEL/3D sensing) is ~11.8% of revenue. Its two >10% customers
+    #         are unnamed and neither is plausibly Apple. Driven by AI datacenter
+    #         optics.
+    #   JBL   Apple exposure was largely sold to BYD Electronic in 2023. The one
+    #         disclosed >10% customer (16%) sits in Intelligent Infrastructure --
+    #         cloud/datacenter, not consumer hardware.
+    #   QCOM  Terminal, decaying customer: Qualcomm expects to supply modems for
+    #         only ~20% of iPhones in 2026, heading to zero by 2027. A static beta
+    #         would keep firing on a relationship that is ending.
+    #   AVGO  The ~20% figure is from FY2022/23 and is stale by two years of
+    #         extreme mix shift; FY2025 AI semiconductor revenue alone is $20B.
+    #   FN    Apple is not a disclosed customer at all. NVIDIA 27.6% and Cisco
+    #         18.2% are its only >10% customers. The link had no factual basis.
 
     # --- Apple services ------------------------------------------------------
-    Link("AAPL", "GOOGL", 0.20, CH_SERVICES, 1, 120, "TAC: Google pays Apple for default search"),
-    Link("AAPL", "MTCH", 0.15, CH_SERVICES, -1, 240, "App Store take-rate pressure"),
-    Link("AAPL", "SPOT", 0.15, CH_SERVICES, -1, 240, "App Store economics"),
-    Link("AAPL", "U", 0.20, CH_SERVICES, 1, 210, "mobile app/ads ecosystem read"),
-    Link("AAPL", "APP", 0.20, CH_SERVICES, 1, 180, "mobile ad-tech ecosystem read"),
+    Link("AAPL", "GOOGL", 0.20, CH_SERVICES, 1, 120,
+         "TAC: Google pays Apple for default search placement"),
+    Link("AAPL", "APP", 0.15, CH_SERVICES, 1, 180, "mobile ad-tech ecosystem read"),
+    Link("AAPL", "U", 0.15, CH_SERVICES, 1, 210, "mobile app/ads ecosystem read"),
 
-    # --- Amazon AWS ----------------------------------------------------------
-    Link("AMZN", "ANET", 0.35, CH_AWS, 1, 120, "hyperscaler switching, AWS a top customer"),
-    Link("AMZN", "AVGO", 0.30, CH_AWS, 1, 120, "custom ASIC (Trainium/Inferentia) + networking"),
-    Link("AMZN", "MRVL", 0.30, CH_AWS, 1, 130, "custom silicon and optics"),
-    Link("AMZN", "NVDA", 0.20, CH_AWS, 1, 90, "GPU demand read, but NVDA has its own cycle"),
-    Link("AMZN", "VRT", 0.35, CH_CAPEX, 1, 150, "datacenter power and cooling"),
-    Link("AMZN", "SMCI", 0.25, CH_CAPEX, 1, 150, "server buildout"),
-    Link("AMZN", "ETN", 0.20, CH_CAPEX, 1, 210, "electrical infrastructure"),
-    Link("AMZN", "GEV", 0.20, CH_CAPEX, 1, 210, "grid/power equipment"),
-    Link("AMZN", "PWR", 0.15, CH_CAPEX, 1, 240, "electrical construction"),
-    Link("AMZN", "DDOG", 0.30, CH_AWS, 1, 150, "cloud consumption read-through"),
-    Link("AMZN", "SNOW", 0.25, CH_AWS, 1, 150, "cloud consumption read-through"),
-    Link("AMZN", "MDB", 0.25, CH_AWS, 1, 165, "cloud consumption read-through"),
-    Link("AMZN", "NET", 0.20, CH_AWS, 1, 180, "edge/cloud consumption"),
-    Link("AMZN", "MSFT", 0.25, CH_AWS, 1, 90, "Azure read-across from AWS growth rate"),
-    Link("AMZN", "GOOGL", 0.25, CH_AWS, 1, 90, "GCP read-across"),
+    # --- Amazon: AWS / custom silicon ---------------------------------------
+    # Of eighteen originally encoded AMZN links, MRVL was the only one that
+    # survived fact-check as a documented, Amazon-specific economic exposure.
+    Link("AMZN", "MRVL", 0.30, CH_AWS, 1, 130,
+         "custom silicon and optics for AWS (confirmed); note Trainium3 socket "
+         "share is contested with Alchip and Amazon's own Annapurna"),
+    Link("AMZN", "MSFT", 0.20, CH_AWS, 1, 90,
+         "Azure read-across from the AWS growth rate"),
+    Link("AMZN", "GOOGL", 0.20, CH_AWS, 1, 90, "GCP read-across"),
 
-    # --- Amazon retail / logistics (the inverse edges) -----------------------
-    Link("AMZN", "SHOP", 0.25, CH_RETAIL, -1, 180, "merchant share competition"),
-    Link("AMZN", "ETSY", 0.20, CH_RETAIL, -1, 210, "marketplace share"),
-    Link("AMZN", "W", 0.20, CH_RETAIL, -1, 210, "online goods share"),
-    Link("AMZN", "TGT", 0.15, CH_RETAIL, -1, 240, "general merchandise share"),
-    Link("AMZN", "FDX", 0.20, CH_LOGISTICS, -1, 210, "Amazon in-housing parcel volume"),
-    Link("AMZN", "UPS", 0.25, CH_LOGISTICS, -1, 200, "Amazon volume insourcing"),
-    Link("AMZN", "CHRW", 0.12, CH_LOGISTICS, -1, 270, "freight brokerage"),
+    # REMOVED after fact-check:
+    #   ANET  Arista's >10% customers are Microsoft (26% of 2025 revenue) and
+    #         Meta (16%). AWS designs its own switches and runs white-box; it is
+    #         not a disclosed concentration customer. The 0.35 beta was a
+    #         narrative. ANET's real event exposure is MSFT and META.
+    #   AVGO  Broadcom is not Amazon's Trainium partner -- that is Marvell,
+    #         Alchip and Annapurna. The stated causal mechanism was simply wrong.
+    #   SMCI  AWS procures ODM-direct (Foxconn, Quanta, Wistron, Inventec,
+    #         Celestica). Supermicro's demand is the neocloud/AI-lab channel,
+    #         structurally the segment that does NOT use ODM-direct.
+    #   DDOG/SNOW/MDB/NET  The documented transmission is peer-to-peer, not from
+    #         AWS: Datadog's print lifted Snowflake and MongoDB, DDOG -> SNOW/MDB.
+    #         Conditioning on AMZN's return is the wrong axis entirely, since
+    #         capex guidance routinely drives AMZN opposite to AWS fundamentals.
 
-    # --- Amazon advertising --------------------------------------------------
-    Link("AMZN", "TTD", 0.30, CH_ADS, 1, 150, "programmatic demand read"),
-    Link("AMZN", "META", 0.20, CH_ADS, 1, 120, "digital ad spend read"),
-    Link("AMZN", "PINS", 0.20, CH_ADS, 1, 180, "digital ad spend read"),
-    Link("AMZN", "RDDT", 0.20, CH_ADS, 1, 180, "digital ad spend read"),
+    # --- Amazon: datacenter capex -------------------------------------------
+    # Sector exposure is documented; Amazon-specific attribution is not. Vertiv
+    # does not disclose revenue from any individual hyperscaler. Betas cut hard
+    # to reflect that these are AI-capex-complex names, not AMZN proxies.
+    Link("AMZN", "VRT", 0.15, CH_CAPEX, 1, 150,
+         "hyperscale + colo >45% of FY2024 revenue, but no Amazon-specific "
+         "disclosure -- this is AI-capex beta, not an AMZN link"),
+    Link("AMZN", "ETN", 0.10, CH_CAPEX, 1, 210,
+         "electrical backlog +48% on datacenter demand; not Amazon-attributable"),
+    Link("AMZN", "GEV", 0.10, CH_CAPEX, 1, 210,
+         "datacenter equipment orders strong; not Amazon-attributable"),
+
+    # --- Amazon: advertising -------------------------------------------------
+    Link("AMZN", "TTD", 0.25, CH_ADS, -1, 150,
+         "INVERSE: Amazon's ad business is TTD's biggest competitive threat, not "
+         "a demand signal -- the original positive sign was backwards"),
+    Link("AMZN", "META", 0.15, CH_ADS, 1, 120, "digital ad spend read, reduced weight"),
+    Link("AMZN", "PINS", 0.15, CH_ADS, 1, 180, "digital ad spend read, reduced weight"),
+
+    # REMOVED after fact-check:
+    #   SHOP/ETSY/W/TGT  The inverse sign is empirically backwards. Measured
+    #         SHOP-AMZN correlation is POSITIVE at every horizon (+0.45 3m,
+    #         +0.42 1y, +0.59 5y) -- they co-move on consumer-discretionary and
+    #         market beta, which dominates competitive substitution. A hard-coded
+    #         inverse beta would have lost systematically.
+    #   FDX/UPS  The economic exposure is real and well documented (Amazon was
+    #         10.6% of UPS 2025 revenue, its largest customer, and UPS is cutting
+    #         that volume >50% by June 2026). But it is mis-specified as a price
+    #         beta: it should fire on Amazon logistics announcements, not on
+    #         AMZN's daily return. FedEx's sign is additionally stale.
 
     # --- Macro: post-FOMC / GDP / PCE ---------------------------------------
-    Link("MACRO_RATES", "XLU", 0.40, CH_RATES, -1, 60, "utilities are bond proxies"),
+    # These are index/ETF duration relationships, not supply-chain inference,
+    # and are not subject to the same "already automated away" critique.
+    Link("MACRO_RATES", "TLT", 0.80, CH_RATES, -1, 30, "long duration, most direct"),
     Link("MACRO_RATES", "XLRE", 0.55, CH_RATES, -1, 60, "REITs are the purest duration equity"),
-    Link("MACRO_RATES", "IWM", 0.45, CH_RATES, -1, 60, "small caps carry floating-rate debt"),
     Link("MACRO_RATES", "KRE", 0.50, CH_RATES, -1, 60, "regional banks: NIM and AFS marks"),
     Link("MACRO_RATES", "XHB", 0.50, CH_RATES, -1, 90, "homebuilders track mortgage rates"),
-    Link("MACRO_RATES", "TLT", 0.80, CH_RATES, -1, 30, "long duration, most direct"),
+    Link("MACRO_RATES", "IWM", 0.45, CH_RATES, -1, 60, "small caps carry floating-rate debt"),
+    Link("MACRO_RATES", "XLU", 0.40, CH_RATES, -1, 60, "utilities are bond proxies"),
     Link("MACRO_RATES", "GLD", 0.30, CH_RATES, -1, 90, "real-rate sensitivity"),
 ]
 

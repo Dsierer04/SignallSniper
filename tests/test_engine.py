@@ -75,30 +75,37 @@ class TestSecondOrder:
         assert not [s for s in sigs if s.ticker == "QRVO"]
 
     def test_inverse_polarity_link_signals_the_other_way(self):
-        """AMZN crushing retail is bad for SHOP. The reflexive trade is wrong."""
+        """Amazon ad strength is a headwind for The Trade Desk, not a tailwind.
+
+        The original inverse edges were SHOP/ETSY/W/TGT on retail. Fact-check
+        killed those: SHOP-AMZN correlation is POSITIVE at every horizon
+        (+0.45 3m, +0.42 1y, +0.59 5y), so a hard-coded inverse beta would have
+        lost systematically. TTD is the inverse link that survived -- Amazon's
+        ad business is TTD's biggest competitive threat.
+        """
         market = MarketState()
         t_pre = now_ns() - 8_000_000_000
         seed(market, "AMZN", 190.0, t_pre, n=40)
-        seed(market, "SHOP", 105.0, t_pre, n=40)
+        seed(market, "TTD", 105.0, t_pre, n=40)
         t_event = now_ns()
         seed(market, "AMZN", 190.0, t_event, n=30, drift=+600.0)
-        seed(market, "SHOP", 105.0, t_event, n=30, drift=0.0)
+        seed(market, "TTD", 105.0, t_event, n=30, drift=0.0)
 
         doc = RawDoc(
             source="edgar", doc_id="acc-2",
             title="8-K - Amazon.com Inc. (0001018724) (Filer)",
             url="", published=None,
-            body="Item 2.02 Results of Operations. Online stores and third-party "
-                 "seller retail revenue exceeded consensus estimates.",
+            body="Item 2.02 Results of Operations. Advertising services revenue "
+                 "exceeded consensus estimates.",
             meta={"form": "8-K", "company": "Amazon.com Inc.", "cik": "1018724",
                   "items": ("2.02",)},
         )
         doc.t_ingest = t_event
         sigs = make_engine(market).on_event(build_event(doc, ("AMZN",)))
 
-        shop = [s for s in sigs if s.ticker == "SHOP"]
-        assert shop, "SHOP should signal on the inverse retail link"
-        assert shop[0].direction is Direction.SHORT
+        ttd = [s for s in sigs if s.ticker == "TTD"]
+        assert ttd, "TTD should signal on the inverse advertising link"
+        assert ttd[0].direction is Direction.SHORT
 
     def test_channel_gating_blocks_irrelevant_links(self):
         """A Services-only story must not propagate to RF front-end suppliers."""
@@ -339,7 +346,7 @@ class TestCalibration:
         {"src": "AAPL", "dst": "SWKS", "lag_capture": 0.18, "dead_rate": 0.10,
          "beta": 0.51, "beta_r2": 0.48, "beta_usable": True},
         # lags but barely trades -> not tradeable
-        {"src": "AAPL", "dst": "QRVO", "lag_capture": 0.80, "dead_rate": 0.55,
+        {"src": "AAPL", "dst": "COHR", "lag_capture": 0.80, "dead_rate": 0.55,
          "beta": 0.40, "beta_r2": 0.40, "beta_usable": True},
         # measured, but the regression is junk -> keep the considered prior
         {"src": "AAPL", "dst": "GLW", "lag_capture": 0.60, "dead_rate": 0.10,
@@ -369,7 +376,7 @@ class TestCalibration:
     def test_unusable_regression_does_not_overwrite_the_prior(self):
         """r2 of 0.01 is a number, not an improvement on a considered prior."""
         links = self._calibrated()
-        assert links["GLW"].beta == pytest.approx(0.30)  # original prior kept
+        assert links["GLW"].beta == pytest.approx(0.15)  # original prior kept
         assert links["GLW"].verified is True             # but lag was measured
 
     def test_instant_repricer_is_excluded_from_verified_only(self):
@@ -382,8 +389,8 @@ class TestCalibration:
 
     def test_illiquid_name_excluded_despite_good_lag(self):
         links = self._calibrated()
-        assert links["QRVO"].lag_capture == 0.80
-        assert links["QRVO"].tradeable_lag is False
+        assert links["COHR"].lag_capture == 0.80
+        assert links["COHR"].tradeable_lag is False
 
     def test_negative_measured_beta_becomes_inverse_polarity(self):
         g = LinkageGraph([Link("X", "Y", 0.5, "test", 1, 60, "n")])
@@ -396,8 +403,8 @@ class TestCalibration:
 
     def test_unlisted_links_are_untouched(self):
         links = self._calibrated()
-        assert links["LITE"].verified is False
-        assert links["LITE"].beta == pytest.approx(0.35)
+        assert links["TXN"].verified is False
+        assert links["TXN"].beta == pytest.approx(0.10)
 
     def test_missing_calibration_file_is_not_an_error(self):
         g = LinkageGraph.calibrated("/nonexistent/path/calibration.json")

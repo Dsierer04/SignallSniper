@@ -109,17 +109,15 @@ class Config:
 JUL30_WATCHLIST: tuple[str, ...] = (
     # issuers
     "AAPL", "AMZN",
-    # Apple hardware complex
-    "CRUS", "SWKS", "QRVO", "LITE", "COHR", "GLW", "JBL", "QCOM", "AVGO", "TXN", "FN",
+    # Apple hardware complex (post fact-check; LITE/JBL/QCOM/AVGO/FN/QRVO removed
+    # -- see market/linkage.py for the filing citations behind each removal)
+    "CRUS", "SWKS", "GLW", "COHR", "TXN",
     # Apple services complex
-    "GOOGL", "MTCH", "SPOT", "U", "APP",
-    # AWS / datacenter complex
-    "ANET", "MRVL", "NVDA", "VRT", "SMCI", "ETN", "GEV", "PWR",
-    "DDOG", "SNOW", "MDB", "NET", "MSFT",
-    # retail / logistics
-    "SHOP", "ETSY", "W", "TGT", "FDX", "UPS", "CHRW",
+    "GOOGL", "APP", "U",
+    # AWS / datacenter complex (ANET/SMCI/DDOG/SNOW/MDB/NET removed)
+    "MRVL", "MSFT", "VRT", "ETN", "GEV",
     # advertising
-    "TTD", "META", "PINS", "RDDT",
+    "TTD", "META", "PINS",
     # macro complex for the 08:30 GDP/PCE print
     "SPY", "QQQ", "IWM", "TLT", "XLU", "XLRE", "KRE", "XHB", "GLD",
 )
