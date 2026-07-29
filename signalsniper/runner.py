@@ -57,12 +57,17 @@ class Runner:
             EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE),
                          blackout_tickers=frozenset(cfg.blackout)),
         )
-        self.risk = RiskManager(RiskConfig(
-            equity=cfg.equity,
+        # for_equity keeps the proportions sane on a small account instead of
+        # leaving a config that silently rejects every order. It does NOT widen
+        # risk_per_trade or the daily loss cap -- those stay as configured.
+        self.risk = RiskManager(RiskConfig.for_equity(
+            cfg.equity,
             risk_per_trade=cfg.risk_per_trade,
             max_daily_loss_frac=cfg.max_daily_loss,
             max_concurrent=cfg.max_concurrent,
         ))
+        for problem in self.risk.cfg.viability():
+            log.warning("account: %s", problem)
         self.enricher: EdgarEnricher | None = None
         #: Set when a live quote source supports mid-stream subscription. Lets
         #: the broad EDGAR path signal on names outside the initial watchlist.
