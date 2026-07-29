@@ -215,6 +215,38 @@ once `validate.py --emit` writes the measurements.
 
 ---
 
+## 5c. What capital this actually needs
+
+Computed from the real sizing code, on a 15% small-cap event -- the best case
+for the path that survived verification:
+
+| Equity | Shorts? | Concurrent | Notional | +15% event | Session (3 wins) |
+|---|---|---|---|---|---|
+| $200 | **no** | 1 | $111 | **$17** | $50 |
+| $500 | no | 1 | $278 | $42 | $125 |
+| $2,000 | **yes** | 1 | $1,111 | $167 | $500 |
+| $10,000 | yes | 4 | $1,110 | $166 | $500 |
+| $25,000 | yes | 4 | $2,775 | $416 | $1,249 |
+| $50,000 | yes | 4 | $5,555 | $833 | $2,500 |
+
+Two things this makes concrete:
+
+1. **$2,000 is the real threshold**, not because of position size but because
+   shorting unlocks there. That single change doubles the tradeable signal set,
+   and it is a bigger jump than the 10x in capital would suggest -- notional
+   goes from $111 to $1,111 because `for_equity` stops having to compensate for
+   an account that cannot hold a position.
+2. **"Thousands in a session" starts around $25,000-$50,000**, and only if the
+   edge is real, which is exactly what has not been established.
+
+Note the dip at $5,000: `risk_per_trade` reverts to the 1% default and
+`max_concurrent` goes to 4, so per-position notional falls while total exposure
+rises. That is correct behaviour -- diversification across four positions rather
+than concentration in one -- but it means the P&L curve is not monotonic in
+equity, and you should not read $2,000 as "better than $5,000".
+
+---
+
 ## 6. My recommendation for tomorrow
 
 **Do not put real money on the second-order trade tomorrow.** Not because of
