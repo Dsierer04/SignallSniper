@@ -1,3 +1,22 @@
+"""LEGACY -- the original SignalSniper Reddit sentiment scraper.
+
+Kept for reference and as an optional pre-market thesis generator. It is NOT in
+the trading path. See docs/DATA_SOURCES.md for the full reasoning; the short
+version is four things:
+
+  1. `scrape_reddit()` runs once on startup and never again -- there is no loop.
+  2. `if ticker in full_text.upper()` matches "AMC" inside "AMC theaters" and
+     "ALL" inside "all of it". Ticker extraction now requires $TICKER or
+     (NASDAQ: X) and filters against the configured universe.
+  3. A general-purpose sentiment model on filing text answers the wrong question
+     at 200ms a pass. The 8-K item code answers the right one in microseconds.
+  4. Social sentiment lags price on anything liquid.
+
+Where it still earns its keep: microcaps where retail flow is the marginal buyer,
+and as a pre-market screen for what is about to get crowded. Run it separately,
+before the bell, and treat the output as a watchlist -- never as a trigger.
+"""
+
 # main.py
 
 import os
