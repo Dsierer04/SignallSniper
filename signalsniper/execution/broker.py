@@ -110,22 +110,44 @@ class AccountSnapshot:
     account_number: str = ""
     is_paper: bool = True
 
+    #: True when the account response actually carried PDT fields. Alpaca removed
+    #: `daytrade_count` and `pattern_day_trader` from /v2/account on 2026-07-06
+    #: when the PDT rule was replaced by the Intraday Margin Framework
+    #: (2026-06-04). Absent fields are not the same as zero, so we track whether
+    #: they were present rather than inferring "0 day trades used" from silence.
+    pdt_fields_present: bool = False
+
     def blockers(self, need_short: bool = False) -> list[str]:
         out: list[str] = []
         if self.trading_blocked:
             out.append("account is trading-blocked")
-        if need_short and not self.shorting_enabled:
-            out.append("shorting is not enabled -- every SHORT signal will reject")
-        if self.pattern_day_trader and self.equity < 25_000:
+
+        if need_short:
+            if not self.shorting_enabled:
+                out.append("shorting is not enabled -- every SHORT signal will reject")
+            elif self.equity < 2_000:
+                # Half the second-order signals are shorts; the margin minimum
+                # still applies even though the $25k PDT threshold does not.
+                out.append(
+                    f"${self.equity:,.0f} equity is under the $2,000 margin/short "
+                    "minimum -- short orders will reject"
+                )
+
+        # Only evaluate the legacy PDT rule if the broker still reports it. On
+        # accounts under the Intraday Margin Framework these fields are gone and
+        # gating on them would either crash or invent a limit that no longer
+        # exists. Buying power is the real constraint there.
+        if self.pdt_fields_present and self.pattern_day_trader and self.equity < 25_000:
             out.append(
                 f"flagged PDT with ${self.equity:,.0f} equity (<$25k) -- "
                 "day trades will be rejected"
             )
-        elif not self.pattern_day_trader and self.equity < 25_000:
+
+        if self.buying_power > 0 and self.buying_power < self.equity * 0.5:
             out.append(
-                f"${self.equity:,.0f} equity is under $25k -- you get 3 day trades "
-                "per rolling 5 days before PDT lockout. This strategy is "
-                "same-day round trips; you will hit it fast."
+                f"buying power ${self.buying_power:,.0f} is well below equity "
+                f"${self.equity:,.0f} -- intraday capacity may bind before the "
+                "risk manager's own limits do"
             )
         return out
 
@@ -167,12 +189,15 @@ class AlpacaBroker:
         r = await self.client.get(f"{self.base}/v2/account", headers=self._headers)
         r.raise_for_status()
         d = r.json()
+        # equity / buying_power / cash come back as JSON *strings*, not numbers.
+        # float() handles both, so this stays correct whichever Alpaca sends.
         return AccountSnapshot(
             equity=float(d.get("equity") or 0.0),
             buying_power=float(d.get("buying_power") or 0.0),
             cash=float(d.get("cash") or 0.0),
             daytrade_count=int(d.get("daytrade_count") or 0),
             pattern_day_trader=bool(d.get("pattern_day_trader")),
+            pdt_fields_present=("pattern_day_trader" in d or "daytrade_count" in d),
             trading_blocked=bool(d.get("trading_blocked")),
             shorting_enabled=bool(d.get("shorting_enabled", True)),
             account_number=str(d.get("account_number", "")),
@@ -230,6 +255,10 @@ class AlpacaBroker:
             )
 
         side = "buy" if order.direction is Direction.LONG else "sell"
+        # qty: the API coerces either a JSON string or number. The documented
+        # form is a string; both official SDKs emit numbers. String is the safer
+        # of the two since it matches the docs and never loses precision.
+        # Short orders must be whole shares -- fractional shorting is rejected.
         payload: dict[str, Any] = {
             "symbol": order.ticker,
             "qty": str(order.shares),

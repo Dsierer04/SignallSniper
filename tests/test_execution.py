@@ -121,15 +121,28 @@ class TestPaperBrokerSubmission:
 
 
 class TestAccountBlockers:
-    def test_pdt_under_25k_is_flagged(self):
-        acct = AccountSnapshot(equity=10_000.0, pattern_day_trader=True)
+    def test_legacy_pdt_flag_still_honoured_when_broker_reports_it(self):
+        acct = AccountSnapshot(equity=10_000.0, pattern_day_trader=True,
+                               pdt_fields_present=True)
         assert any("PDT" in b for b in acct.blockers())
 
-    def test_under_25k_warns_about_the_three_day_trade_limit(self):
-        """This strategy is same-day round trips. Sub-$25k accounts hit PDT fast."""
-        acct = AccountSnapshot(equity=10_000.0, pattern_day_trader=False)
-        blockers = acct.blockers()
-        assert any("3 day trades" in b for b in blockers)
+    def test_absent_pdt_fields_do_not_invent_a_limit(self):
+        """Alpaca removed pattern_day_trader/daytrade_count from /v2/account on
+        2026-07-06 when the PDT rule was replaced by the Intraday Margin
+        Framework. Absent is not the same as False, and gating on a rule that
+        no longer exists would block trades for no reason."""
+        acct = AccountSnapshot(equity=10_000.0, pdt_fields_present=False)
+        assert not any("PDT" in b or "day trade" in b for b in acct.blockers())
+
+    def test_short_below_margin_minimum_is_flagged(self):
+        """The $25k PDT threshold is gone; the $2,000 margin minimum is not."""
+        acct = AccountSnapshot(equity=1_500.0, shorting_enabled=True)
+        assert any("2,000" in b for b in acct.blockers(need_short=True))
+        assert acct.blockers(need_short=False) == []
+
+    def test_low_buying_power_relative_to_equity_is_flagged(self):
+        acct = AccountSnapshot(equity=50_000.0, buying_power=5_000.0)
+        assert any("buying power" in b for b in acct.blockers())
 
     def test_shorting_disabled_is_flagged_when_needed(self):
         acct = AccountSnapshot(equity=50_000.0, shorting_enabled=False)
@@ -141,7 +154,8 @@ class TestAccountBlockers:
         assert any("blocked" in b for b in acct.blockers())
 
     def test_healthy_account_is_clean(self):
-        acct = AccountSnapshot(equity=50_000.0, shorting_enabled=True)
+        acct = AccountSnapshot(equity=50_000.0, buying_power=100_000.0,
+                               shorting_enabled=True)
         assert acct.blockers(need_short=True) == []
 
 

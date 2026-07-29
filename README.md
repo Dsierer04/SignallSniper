@@ -2,8 +2,26 @@
 
 Low-latency event ingestion and **second-order** signal generation for US equities.
 
-The thesis in one line: **you will not beat colocated HFT to a headline, so don't
-try — trade the propagation instead.**
+> ## ⚠️ Read [docs/VERIFICATION.md](docs/VERIFICATION.md) first
+>
+> A literature review **refuted the core thesis at the timescale this was built
+> for.** Cohen & Frazzini — the paper the design leans on — documents a *monthly*
+> effect with no intraday analysis at all; the high-frequency evidence says
+> linked firms reprice same-session and effectively simultaneously, machine-
+> mediated. The "human inference bottleneck" this exploits has largely been
+> automated away.
+>
+> A fact-check also removed **11 of 24 links** and corrected 4 betas. Two were
+> not merely stale but backwards: Arista's top customers are Microsoft and Meta,
+> not AWS; and the SHOP/AMZN "inverse" link is empirically positive at every
+> horizon (+0.42 1y), so it would have lost systematically.
+>
+> The engineering is sound. The signal is unproven. Measure before you bet:
+> `python3 tools/validate.py --primary AAPL --feed sip`.
+
+The original thesis: **you will not beat colocated HFT to a headline, so don't
+try — trade the propagation instead.** That remains true about the headline. It
+is the *propagation* half that did not survive verification.
 
 When Apple prints at 16:05, AAPL reprices in under 50 milliseconds and you are
 not in that race. But Cirrus Logic, which books ~90% of its revenue from Apple,

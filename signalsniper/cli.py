@@ -270,7 +270,12 @@ async def cmd_preflight(args) -> int:
     print(f"  account        : {acct.account_number}")
     print(f"  equity         : ${acct.equity:,.2f}")
     print(f"  buying power   : ${acct.buying_power:,.2f}")
-    print(f"  day trades used: {acct.daytrade_count}")
+    if acct.pdt_fields_present:
+        print(f"  day trades used: {acct.daytrade_count} (legacy PDT reporting)")
+    else:
+        print("  day trades     : not reported -- account is on the Intraday")
+        print("                   Margin Framework (PDT retired 2026-06-04);")
+        print("                   buying power is the binding constraint")
     print(f"  shorting       : {'enabled' if acct.shorting_enabled else 'DISABLED'}")
 
     blockers = acct.blockers(need_short=True)
