@@ -447,3 +447,53 @@ class TestLinkageGraph:
         g = LinkageGraph([Link("XYZ", "ABC", 0.9, "test")])
         assert [l.dst for l in g.neighbors("XYZ")] == ["ABC"]
         assert g.neighbors("AAPL") == []
+
+
+class TestOwnEarningsBlackout:
+    """A name repricing on its OWN guidance is not a read-through from someone
+    else's print, and reading its move as 'hasn't repriced yet' inverts the
+    signal's meaning.
+
+    Not hypothetical: SWKS and QRVO both reported 2026-07-28, two days before
+    Apple's 2026-07-30 print. They were two of the three headline supplier names.
+    """
+
+    def _market(self):
+        market = MarketState()
+        t_pre = now_ns() - 8_000_000_000
+        for tick, px in (("AAPL", 232.0), ("CRUS", 104.0), ("SWKS", 78.0)):
+            seed(market, tick, px, t_pre, n=40)
+        t_event = now_ns()
+        seed(market, "AAPL", 232.0, t_event, n=30, drift=-420.0)
+        seed(market, "CRUS", 104.0, t_event, n=30, drift=-60.0)
+        seed(market, "SWKS", 78.0, t_event, n=30, drift=-40.0)
+        return market, t_event
+
+    def _engine(self, blackout):
+        return SignalEngine(market=self._m, graph=LinkageGraph(), config=EngineConfig(
+            move_scale=dict(DEFAULT_MOVE_SCALE), verified_links_only=False,
+            blackout_tickers=frozenset(blackout)))
+
+    def test_blacked_out_name_does_not_signal(self):
+        market, t_event = self._market()
+        self._m = market
+        event = build_event(aapl_doc(t_event), ("AAPL",))
+
+        without = {s.ticker for s in self._engine(set()).evaluate_second_order(event)}
+        assert "SWKS" in without
+
+        engine = self._engine({"SWKS"})
+        with_bl = {s.ticker for s in engine.evaluate_second_order(event)}
+        assert "SWKS" not in with_bl
+        assert "CRUS" in with_bl          # unrelated names unaffected
+        assert engine.rejected.get("own_earnings_blackout") == 1
+
+    def test_jul30_config_blacks_out_the_names_that_already_reported(self):
+        from signalsniper.config import load
+        assert {"SWKS", "QRVO"} <= set(load().blackout)
+
+    def test_runner_wires_the_blackout_into_the_engine(self):
+        from signalsniper.config import load
+        from signalsniper.runner import Runner
+        cfg = load(sec_user_agent="T t@e.com")
+        assert "SWKS" in Runner(cfg).engine.cfg.blackout_tickers

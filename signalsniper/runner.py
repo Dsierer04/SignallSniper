@@ -54,7 +54,8 @@ class Runner:
         self.engine = SignalEngine(
             self.market,
             self.graph,
-            EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE)),
+            EngineConfig(move_scale=dict(DEFAULT_MOVE_SCALE),
+                         blackout_tickers=frozenset(cfg.blackout)),
         )
         self.risk = RiskManager(RiskConfig(
             equity=cfg.equity,

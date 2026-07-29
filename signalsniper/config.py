@@ -74,6 +74,9 @@ class Config:
     #: tape on the *linked* names, so this must include the whole complex, not
     #: just the issuers you care about.
     watchlist: tuple[str, ...] = ()
+    #: Names excluded from second-order propagation because they have their own
+    #: earnings event in the window.
+    blackout: frozenset[str] = frozenset()
 
     def validate(self) -> list[str]:
         problems: list[str] = []
@@ -123,8 +126,20 @@ JUL30_WATCHLIST: tuple[str, ...] = (
 )
 
 
+#: Linked names that reported their OWN earnings in the days around 2026-07-30.
+#: A name repricing on its own guidance is not available as a read-through from
+#: someone else's print, and reading its move as "hasn't repriced yet" inverts
+#: the meaning of the signal.
+#:
+#: Skyworks and Qorvo both reported 2026-07-28 -- two days BEFORE Apple. They
+#: were two of the three headline supplier names in the linkage graph.
+JUL30_BLACKOUT: frozenset[str] = frozenset({"SWKS", "QRVO"})
+
+
 def load(**overrides) -> Config:
     cfg = Config(**overrides)
     if not cfg.watchlist:
         cfg.watchlist = JUL30_WATCHLIST
+    if not cfg.blackout:
+        cfg.blackout = JUL30_BLACKOUT
     return cfg

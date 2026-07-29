@@ -139,6 +139,38 @@ opposite direction. Now polls order status and corrects.
 
 ---
 
+## 4c. Three findings that matter more than the theory
+
+An independent historical-reaction stream confirmed the refutation and added
+three things that change the trade directly:
+
+**1. Two of the three headline names are invalid for tomorrow.** **Skyworks and
+Qorvo both reported their own earnings on 2026-07-28** — two days *before* Apple.
+They are repricing on their own guidance, so reading their move as "hasn't
+repriced on Apple yet" is reading the wrong signal entirely. `blackout_tickers`
+now excludes them and `JUL30_BLACKOUT` is wired into config.
+
+**2. The second-order move is a NEXT-DAY-OPEN phenomenon.** Every contemporaneous
+account found quantifies supplier moves at next-day premarket or the next regular
+session — never as a completed same-evening move. In the January 2019 Apple
+warning (the sharpest case available), premarket magnitudes were *smaller* than
+the eventual full-day moves. So an after-hours entry carries **full overnight gap
+risk** — a fundamentally different and worse risk profile than the strategy
+assumes, and one the client-side-stop problem makes worse still.
+
+**3. Suppliers frequently move OPPOSITE to the customer's surprise.** On
+2026-05-01 Apple reported excellent results and *Cirrus fell more than 1%*. And
+causality has run backwards in the most-cited episode: ahead of Apple's Jan 2019
+warning, Qorvo, Cirrus, Lumentum and AMS had **already** cut their own forecasts.
+The suppliers led Apple, not the other way round.
+
+Also flagged **UNVERIFIABLE**: no public source gives tick-level extended-hours
+spread or depth for CRUS/SWKS/QRVO/VRT. Whether these can be traded in size
+between 16:00 and 20:00 at all is simply unknown from public data — and the SEC's
+own guidance on reduced after-hours liquidity points the wrong way.
+
+---
+
 ## 5. What survives
 
 Not nothing:

@@ -82,6 +82,16 @@ class EngineConfig:
     #: against the tape. An unchecked economic story is not worth the same as a
     #: measured one.
     unverified_penalty: float = 0.60
+    #: Linked names excluded from propagation because they have had their OWN
+    #: earnings event recently. Such a name is repricing on its own guidance, not
+    #: on the primary's read-through, and treating its move as "hasn't repriced
+    #: yet" is reading the wrong signal entirely.
+    #:
+    #: This is not hypothetical for 2026-07-30: Skyworks and Qorvo both reported
+    #: on 2026-07-28, two days BEFORE Apple. They were two of the three headline
+    #: names in this graph and are structurally invalid as Apple read-throughs
+    #: this week.
+    blackout_tickers: frozenset[str] = frozenset()
 
     def scale_for(self, ticker: str) -> float:
         if not self.move_scale:
@@ -237,6 +247,11 @@ class SignalEngine:
 
         signals: list[Signal] = []
         for link in links:
+            if link.dst in cfg.blackout_tickers:
+                # Its own earnings dominate; the primary read-through is noise
+                # against that, and "hasn't moved yet" means something else here.
+                self._reject("own_earnings_blackout")
+                continue
             implied = primary_move * link.beta * link.polarity
             if abs(implied) < cfg.min_edge_bps:
                 self._reject("implied_too_small")
