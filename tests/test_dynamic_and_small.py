@@ -2,6 +2,7 @@
 from __future__ import annotations
 import pytest
 from signalsniper.config import Config
+from signalsniper.models import Direction
 from signalsniper.market.quotes import AlpacaQuoteStream
 from signalsniper.models import RawDoc, now_ns
 from signalsniper.runner import Runner
@@ -166,3 +167,83 @@ class TestSmallAccountViability:
         base, big = RiskConfig(), RiskConfig.for_equity(25_000.0)
         assert big.max_position_frac == base.max_position_frac
         assert big.max_concurrent == base.max_concurrent
+
+
+class TestSmallAccountOrderMechanics:
+    """What a $200 account can and cannot actually send."""
+
+    def _sig(self, px, direction=Direction.LONG, edge=300.0):
+        from signalsniper.models import Event, EventKind, RawDoc, Signal
+        doc = RawDoc(source="t", doc_id="d", title="t", url="", published=None)
+        ev = Event(doc=doc, kind=EventKind.EARNINGS, tickers=("X",),
+                   materiality=0.8, prior=direction, confidence=0.8)
+        return Signal(ticker="X", direction=direction, edge_bps=edge,
+                      confidence=0.7, event=ev, ref_price=px)
+
+    def test_fractional_makes_an_expensive_stock_buyable(self):
+        """At $200 a $230 stock is unbuyable in whole shares."""
+        from signalsniper.signal.risk import RiskManager
+        rm = RiskManager(RiskConfig.for_equity(200.0))
+        order = rm.size_order(self._sig(230.0))
+        assert order is not None
+        assert order.is_fractional
+        assert 0 < order.shares < 1
+        assert order.notional <= 200.0
+
+    def test_fractional_sizes_to_risk_not_to_share_price(self):
+        """Whole-share quantization forces position size to whatever one share
+        costs; fractional lets it track the risk budget instead."""
+        from signalsniper.signal.risk import RiskManager
+        notionals = []
+        for px in (45.0, 104.0, 230.0):
+            rm = RiskManager(RiskConfig.for_equity(200.0))
+            notionals.append(rm.size_order(self._sig(px)).notional)
+        assert max(notionals) - min(notionals) < 1.0   # same risk, any price
+
+    def test_shorts_are_refused_below_the_regulatory_floor(self):
+        """FINRA 4210(b)/Reg T is a $2,000 floor. Sending it anyway earns a
+        broker rejection that costs the whole window."""
+        from signalsniper.signal.risk import RiskManager
+        rm = RiskManager(RiskConfig.for_equity(200.0))
+        assert rm.size_order(self._sig(104.0, Direction.SHORT)) is None
+        assert rm.rejects.get("short_blocked_below_2k") == 1
+
+    def test_shorts_work_once_funded_above_the_floor(self):
+        from signalsniper.signal.risk import RiskManager
+        rm = RiskManager(RiskConfig.for_equity(5_000.0))
+        assert rm.size_order(self._sig(104.0, Direction.SHORT)) is not None
+
+    def test_shorts_stay_whole_share_even_when_fractional_is_on(self):
+        """Fractional shorts are not permitted at any equity level."""
+        from signalsniper.signal.risk import RiskManager
+        cfg = RiskConfig.for_equity(10_000.0)
+        cfg.allow_fractional = True
+        order = RiskManager(cfg).size_order(self._sig(104.0, Direction.SHORT))
+        assert order is not None
+        assert not order.is_fractional
+
+
+class TestFreeTierChannelBudget:
+    """The free plan allows ONE connection and 30 channels for trades+quotes
+    COMBINED. Exceeding it presents as a connected socket delivering nothing."""
+
+    def test_default_watchlist_exceeds_the_cap_with_both_streams(self):
+        from signalsniper.config import load
+        from signalsniper.market.quotes import AlpacaQuoteStream
+        ok, msg = AlpacaQuoteStream("k", "s", load().watchlist).channel_budget_ok()
+        assert ok is False and "exceeds" in msg
+
+    def test_quotes_only_fits(self):
+        from signalsniper.config import load
+        from signalsniper.market.quotes import AlpacaQuoteStream
+        st = AlpacaQuoteStream("k", "s", load().watchlist, subscribe_trades=False)
+        assert st.channel_budget_ok()[0] is True
+
+    def test_channel_count_tracks_dynamic_subscription(self):
+        from signalsniper.market.quotes import AlpacaQuoteStream
+        st = AlpacaQuoteStream("k", "s", ["AAPL"], subscribe_trades=False)
+        assert st.channels_used == 1
+        import asyncio
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            st.add_symbols(["TINY", "SMOL"]))
+        assert st.channels_used == 3

@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import AsyncIterator, Iterable, Protocol
+from typing import Any, AsyncIterator, Iterable, Protocol
 
 from ..models import Quote, epoch_ns
 
@@ -54,6 +54,7 @@ class AlpacaQuoteStream:
         feed: str = "iex",
         url: str | None = None,
         max_symbols: int = 200,
+        subscribe_trades: bool = True,
     ) -> None:
         self.key = key
         self.secret = secret
@@ -63,8 +64,31 @@ class AlpacaQuoteStream:
         self.connected = False
         self.messages = 0
         self.max_symbols = max_symbols
+        #: Alpaca's free Basic plan allows ONE websocket connection and caps
+        #: subscriptions at 30 channels for trades and quotes COMBINED. Sending
+        #: both streams for 27 symbols is 54 channels and the venue rejects the
+        #: subscription -- which presents as a connected socket that delivers
+        #: nothing, i.e. indistinguishable from a quiet market. Quotes alone
+        #: carry the bid/ask the engine actually needs, so trades are the half
+        #: to drop when the budget is tight.
+        self.subscribe_trades = subscribe_trades
         self._ws = None
         self._pending: list[str] = []
+
+    @property
+    def channels_used(self) -> int:
+        return len(self.symbols) * (2 if self.subscribe_trades else 1)
+
+    def channel_budget_ok(self, cap: int = 30) -> tuple[bool, str]:
+        used = self.channels_used
+        if used <= cap:
+            return True, f"{used}/{cap} channels"
+        streams = "quotes+trades" if self.subscribe_trades else "quotes"
+        return False, (
+            f"{used} channels ({len(self.symbols)} symbols x {streams}) exceeds "
+            f"the {cap}-channel free-tier cap -- the venue will reject the "
+            f"subscription and the socket will deliver nothing"
+        )
 
     async def add_symbols(self, symbols: Iterable[str]) -> list[str]:
         """Subscribe to more symbols on a live socket.
@@ -94,9 +118,10 @@ class AlpacaQuoteStream:
             # the initial subscribe.
             return fresh
         try:
-            await self._ws.send(json.dumps({
-                "action": "subscribe", "quotes": fresh, "trades": fresh,
-            }))
+            sub: dict[str, Any] = {"action": "subscribe", "quotes": fresh}
+            if self.subscribe_trades:
+                sub["trades"] = fresh
+            await self._ws.send(json.dumps(sub))
             log.info("subscribed mid-stream to %s", ",".join(fresh))
         except Exception as exc:
             log.warning("mid-stream subscribe failed for %s: %r", fresh, exc)
@@ -133,11 +158,11 @@ class AlpacaQuoteStream:
                     # restored only the original watchlist would silently drop
                     # the dynamically-added names -- and those are exactly the
                     # ones with a live position or a pending signal.
-                    await ws.send(json.dumps({
-                        "action": "subscribe",
-                        "quotes": self.symbols,
-                        "trades": self.symbols,
-                    }))
+                    sub: dict[str, Any] = {"action": "subscribe",
+                                           "quotes": list(self.symbols)}
+                    if self.subscribe_trades:
+                        sub["trades"] = list(self.symbols)
+                    await ws.send(json.dumps(sub))
                     self._pending.clear()
                     self.connected = True
                     backoff = 0.5

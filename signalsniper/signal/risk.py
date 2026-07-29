@@ -54,6 +54,23 @@ class RiskConfig:
     #: Absolute floor on order size, below which commissions dominate.
     min_shares: int = 1
     min_notional: float = 200.0
+    #: Allow fractional share quantities. Essential on a small account: at $200
+    #: a $230 stock is simply unbuyable in whole shares, and whole-share
+    #: quantization on a $104 name means one share is 52% of the account with no
+    #: room to size to risk. Alpaca supports 5,000+ fractionable US securities,
+    #: $1 minimum per order.
+    #:
+    #: Fractional SHORTS are never permitted at any equity level, so this only
+    #: ever applies to longs -- enforced in size_order.
+    allow_fractional: bool = False
+    #: Smallest fractional quantity worth sending.
+    min_fractional_qty: float = 0.01
+    #: Equity floor below which short orders are refused locally. FINRA
+    #: 4210(b)/Reg T set $2,000 for any margin or short activity and Alpaca
+    #: enforces it, so sending a short below this earns a broker rejection --
+    #: which costs the whole window while you work out why. Refuse it here, at
+    #: sizing time, where the reason is legible.
+    short_min_equity: float = 2_000.0
 
     def viability(self, typical_price: float = 100.0) -> list[str]:
         """Can an account this size actually place a trade at all?
@@ -84,10 +101,17 @@ class RiskConfig:
                 f"${typical_price:,.0f} stock"
             )
         if self.equity < 2_000:
+            # Alpaca does not offer cash accounts -- every account is a margin
+            # account, and sub-$2,000 ones are "limited margin": 1x buying power
+            # with shorting disabled, but unsettled funds ARE floated. So T+1
+            # settlement and good-faith violations do NOT apply here; only the
+            # short block does. (An earlier version of this warning claimed the
+            # opposite and was wrong.)
             out.append(
-                f"${self.equity:,.0f} is below the $2,000 Reg T margin minimum -- "
-                "this is a CASH account, so SHORT SELLING IS IMPOSSIBLE and "
-                "sale proceeds must settle before reuse"
+                f"${self.equity:,.0f} is below the $2,000 FINRA 4210(b)/Reg T "
+                "minimum -- SHORT SELLING IS IMPOSSIBLE (regulatory, not "
+                "appealable), and buying power is 1x equity with no leverage. "
+                "Roughly half of this system's signals are shorts."
             )
         return out
 
@@ -101,6 +125,9 @@ class RiskConfig:
         """
         cfg = cls(equity=equity, **overrides)
         if equity < 5_000:
+            # Whole-share quantization dominates a small account: it forces
+            # position size to whatever one share costs rather than to risk.
+            cfg.allow_fractional = True
             # One position at a time, most of the account, and a notional floor
             # low enough that an order can exist at all.
             cfg.max_position_frac = min(0.90, cfg.max_position_frac * 4)
@@ -115,7 +142,7 @@ class RiskConfig:
 class Position:
     ticker: str
     direction: Direction
-    shares: int
+    shares: float
     entry: float
     stop: float
     target: float
@@ -130,7 +157,7 @@ class Position:
 class Order:
     ticker: str
     direction: Direction
-    shares: int
+    shares: float
     limit: float
     stop: float
     target: float
@@ -141,10 +168,15 @@ class Order:
     def notional(self) -> float:
         return self.shares * self.limit
 
+    @property
+    def is_fractional(self) -> bool:
+        return abs(self.shares - round(self.shares)) > 1e-9
+
     def describe(self) -> str:
         side = "BUY" if self.direction is Direction.LONG else "SELL SHORT"
+        qty = f"{self.shares:g}" if self.is_fractional else f"{int(self.shares)}"
         return (
-            f"{side} {self.shares} {self.ticker} @ {self.limit:.2f} "
+            f"{side} {qty} {self.ticker} @ {self.limit:.2f} "
             f"stop {self.stop:.2f} target {self.target:.2f} "
             f"(${self.notional:,.0f} notional)"
         )
@@ -220,6 +252,10 @@ class RiskManager:
         if signal.direction is Direction.NEUTRAL:
             self._reject("neutral")
             return None
+        if (signal.direction is Direction.SHORT
+                and cfg.equity < cfg.short_min_equity):
+            self._reject("short_blocked_below_2k")
+            return None
         if signal.ref_price <= 0:
             self._reject("no_price")
             return None
@@ -248,14 +284,26 @@ class RiskManager:
             return None
 
         risk_dollars = cfg.equity * cfg.risk_per_trade
-        shares = int(risk_dollars // stop_dist)
+
+        # Fractional quantities are longs only -- fractional shorts are not
+        # permitted at any equity level.
+        fractional = cfg.allow_fractional and signal.direction is Direction.LONG
+        if fractional:
+            shares = risk_dollars / stop_dist
+        else:
+            shares = float(int(risk_dollars // stop_dist))
 
         # Notional cap can bind before the risk budget does on a low-vol name.
         max_notional = cfg.equity * cfg.max_position_frac
         if shares * px > max_notional:
-            shares = int(max_notional // px)
+            shares = (max_notional / px) if fractional else float(int(max_notional // px))
 
-        if shares < cfg.min_shares:
+        if fractional:
+            shares = round(shares, 4)
+            if shares < cfg.min_fractional_qty:
+                self._reject("size_zero")
+                return None
+        elif shares < cfg.min_shares:
             self._reject("size_zero")
             return None
         if shares * px < cfg.min_notional:

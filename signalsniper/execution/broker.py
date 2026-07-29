@@ -267,9 +267,11 @@ class AlpacaBroker:
         # form is a string; both official SDKs emit numbers. String is the safer
         # of the two since it matches the docs and never loses precision.
         # Short orders must be whole shares -- fractional shorting is rejected.
+        qty = (f"{order.shares:g}" if order.is_fractional
+               else str(int(order.shares)))
         payload: dict[str, Any] = {
             "symbol": to_broker_symbol(order.ticker),
-            "qty": str(order.shares),
+            "qty": qty,
             "side": side,
             "type": "limit",
             "limit_price": f"{order.limit:.2f}",

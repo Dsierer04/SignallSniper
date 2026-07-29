@@ -54,9 +54,12 @@ class TestSizing:
             assert abs(order.limit - order.stop) >= 100.0 * 40.0 / 10_000.0 - 1e-9
 
     def test_sub_minimum_notional_rejected(self):
+        # LONG, because a SHORT at $500 equity is refused earlier by the
+        # $2,000 regulatory floor and would test the wrong gate.
         rm = RiskManager(RiskConfig(equity=500.0, risk_per_trade=0.01,
                                     min_notional=200.0))
-        assert rm.size_order(make_signal(edge_bps=300.0, price=100.0)) is None
+        assert rm.size_order(
+            make_signal(direction=Direction.LONG, edge_bps=300.0, price=100.0)) is None
         assert rm.rejects.get("below_min_notional") or rm.rejects.get("size_zero")
 
     def test_stop_and_target_on_the_correct_sides(self):
