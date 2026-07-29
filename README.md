@@ -16,6 +16,10 @@ Low-latency event ingestion and **second-order** signal generation for US equiti
 > not AWS; and the SHOP/AMZN "inverse" link is empirically positive at every
 > horizon (+0.42 1y), so it would have lost systematically.
 >
+> Consequently `verified_links_only` defaults to **True**, and since nothing in
+> the shipped graph is measured, **the second-order path emits nothing** until
+> you run the validation. That silence is deliberate.
+>
 > The engineering is sound. The signal is unproven. Measure before you bet:
 > `python3 tools/validate.py --primary AAPL --feed sip`.
 
@@ -61,7 +65,7 @@ trade. The same event thirty seconds later is somebody else's exit liquidity.
 pip install -r requirements.txt
 export SEC_USER_AGENT="Your Name you@example.com"   # SEC requires this; anonymous polling gets blocked
 
-python3 -m pytest -q                # 155 tests, no network needed
+python3 -m pytest -q                # 236 tests, no network needed
 python3 -m signalsniper demo        # end-to-end proof against a synthetic tape
 python3 -m signalsniper doctor      # verify credentials + SEC connectivity
 python3 -m signalsniper preflight   # account, session, feed quality, PDT status
