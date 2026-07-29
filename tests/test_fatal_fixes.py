@@ -337,3 +337,92 @@ class TestStartupAdoption:
 
         runner = self._runner(Broken())
         assert await runner.adopt_broker_positions() == 0
+
+
+class TestGateIsNotABetaErrorDetector:
+    """On a PERFECTLY EFFICIENT tape -- linked name already repriced at its true
+    beta, zero exploitable edge by construction -- the gate still fired whenever
+    the hand-set beta exceeded the true one by 35%+. It was a beta-overstatement
+    detector wearing a mispricing costume, and because an understated beta is
+    rejected as 'overshot', 100% of emitted signals were overstatements."""
+
+    B_HAT = 0.85
+
+    def _efficient(self, b_true, beta_stderr=None, require_bar=False):
+        from signalsniper.market.linkage import Link, LinkageGraph
+        from signalsniper.parse.classify import build_event
+        from signalsniper.signal.engine import (
+            DEFAULT_MOVE_SCALE, EngineConfig, SignalEngine)
+
+        m = MarketState()
+        t0 = datetime.now(timezone.utc) - timedelta(seconds=120)
+        ev = t0 + timedelta(seconds=60)
+        for tick, px, mv in (("AAPL", 232.0, -0.042),
+                             ("CRUS", 104.0, -0.042 * b_true)):
+            for i in range(30):
+                m.on_quote(venue_quote(tick, px, t0 + timedelta(seconds=i)))
+            after = px * (1 + mv)
+            for i in range(1, 31):
+                m.on_quote(venue_quote(tick, after, ev + timedelta(seconds=i)))
+
+        doc = RawDoc(source="edgar", doc_id="d",
+                     title="8-K - Apple Inc. (0000320193) (Filer)",
+                     url="", published=None,
+                     body="Item 2.02 Results of Operations. iPhone hardware "
+                          "guidance lowered below consensus estimates.",
+                     meta={"form": "8-K", "company": "Apple Inc.",
+                           "cik": "320193", "items": ("2.02",)})
+        doc.t_ingest = _parse_rfc3339_ns(ev.isoformat())
+
+        g = LinkageGraph([Link("AAPL", "CRUS", self.B_HAT, "iphone_hardware",
+                               1, 90, "t", beta_stderr=beta_stderr)])
+        e = SignalEngine(m, g, EngineConfig(
+            move_scale=dict(DEFAULT_MOVE_SCALE), verified_links_only=False,
+            require_beta_error_bar=require_bar))
+        return e.evaluate_second_order(build_event(doc, ("AAPL",))), e
+
+    def test_without_an_error_bar_it_fires_on_zero_true_edge(self):
+        """Documents the defect. b_true=0.40 against b_hat=0.85 is pure
+        parameter error, yet the gate reports real 'edge'."""
+        sigs, _ = self._efficient(0.40)
+        assert sigs, "expected the documented false positive"
+        assert sigs[0].edge_bps > 100
+
+    def test_the_firing_boundary_is_exactly_beta_overstatement(self):
+        assert self._efficient(0.85)[0] == []       # correct beta -> overshot
+        assert self._efficient(0.60)[0] == []       # 0.71 ratio -> above 0.65
+        assert self._efficient(0.55)[0] != []       # 0.65 ratio -> fires
+        assert self._efficient(1.20)[0] == []       # understated -> overshot
+
+    def test_an_error_bar_suppresses_the_false_positive(self):
+        """The residual is entirely explained by beta uncertainty, so it is not
+        a mispricing and must not be traded."""
+        sigs, engine = self._efficient(0.40, beta_stderr=0.30)
+        assert sigs == []
+        assert engine.rejected.get("within_beta_error")
+
+    def test_a_tight_error_bar_still_allows_a_real_dislocation(self):
+        """A well-measured beta means a residual really is a mispricing."""
+        sigs, _ = self._efficient(0.40, beta_stderr=0.02)
+        assert sigs, "a tight error bar should not veto a genuine residual"
+
+    def test_requiring_an_error_bar_rejects_unmeasured_links(self):
+        sigs, engine = self._efficient(0.40, beta_stderr=None, require_bar=True)
+        assert sigs == []
+        assert engine.rejected.get("no_beta_error_bar")
+
+
+class TestBetaStandardError:
+    def test_stderr_shrinks_with_more_and_cleaner_data(self):
+        from signalsniper.validate.study import estimate_beta
+        from test_validate import PRIMARY, LAGGER, T0, build, FLAT
+        from signalsniper.validate.study import profile_event
+
+        few = [profile_event(f"E{i}", PRIMARY, LAGGER, T0) for i in range(4)]
+        many = [profile_event(f"E{i}", PRIMARY, LAGGER, T0) for i in range(40)]
+        assert estimate_beta(many).beta_stderr <= estimate_beta(few).beta_stderr
+
+    def test_stderr_is_infinite_without_enough_points(self):
+        from signalsniper.validate.study import BetaEstimate
+        assert BetaEstimate("X", "Y", 2, 0.5, 0.9, 10.0)._sxx == 0.0
+        assert BetaEstimate("X", "Y", 2, 0.5, 0.9, 10.0).beta_stderr == float("inf")

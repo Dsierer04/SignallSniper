@@ -211,10 +211,23 @@ class BetaEstimate:
     r_squared: float
     residual_bps: float   # stdev of residuals -- the error bar that matters
     prior_beta: float = 0.0
+    _sxx: float = 0.0     # sum of squared primary moves, for the slope's se
 
     @property
     def prior_error(self) -> float:
         return self.beta - self.prior_beta
+
+    @property
+    def beta_stderr(self) -> float:
+        """Standard error of the slope, in beta units.
+
+        For a through-origin fit, se(beta) = sd(residuals) / sqrt(sum(x^2)).
+        This is what lets the engine ask whether a residual exceeds what beta
+        uncertainty alone explains, rather than firing on its own parameter error.
+        """
+        if self.n < 3 or self._sxx <= 0:
+            return float("inf")
+        return self.residual_bps / (self._sxx ** 0.5)
 
     @property
     def usable(self) -> bool:
@@ -223,7 +236,8 @@ class BetaEstimate:
 
     def describe(self) -> str:
         flag = "" if self.usable else "  [INSUFFICIENT]"
-        return (f"{self.linked:<6} n={self.n:<3} beta={self.beta:+.2f} "
+        return (f"{self.linked:<6} n={self.n:<3} beta={self.beta:+.2f}"
+                f"+/-{self.beta_stderr:.2f} "
                 f"(prior {self.prior_beta:+.2f}, err {self.prior_error:+.2f})  "
                 f"r2={self.r_squared:.2f} resid={self.residual_bps:.0f}bps{flag}")
 
@@ -255,7 +269,7 @@ def estimate_beta(profiles: list[EventProfile], prior: float = 0.0) -> BetaEstim
         linked=profiles[0].linked, primary=profiles[0].primary, n=len(pts),
         beta=beta, r_squared=max(0.0, r2),
         residual_bps=statistics.pstdev(resid) if len(resid) > 1 else 0.0,
-        prior_beta=prior,
+        prior_beta=prior, _sxx=sxx,
     )
 
 

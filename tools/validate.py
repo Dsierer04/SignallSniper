@@ -209,6 +209,8 @@ async def run(args) -> int:
                 "dead_rate": round(v.dead_early_rate, 4),
                 "median_move_bps": round(v.median_total_bps, 1),
                 "beta": round(b.beta, 4) if b else None,
+                "beta_stderr": (round(b.beta_stderr, 4)
+                                if b and b.beta_stderr != float("inf") else None),
                 "beta_r2": round(b.r_squared, 4) if b else None,
                 "beta_usable": bool(b and b.usable),
                 "prior_beta": round(priors.get(t, 0.0), 4),

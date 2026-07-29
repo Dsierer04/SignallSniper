@@ -75,6 +75,30 @@ class Link:
     #: events. High values mean "hasn't moved" usually meant "hasn't traded".
     dead_rate: float | None = None
 
+    #: Standard error of `beta`, in beta units, from the historical regression.
+    #: None means UNKNOWN, which is not the same as zero.
+    #:
+    #: This exists because of a proof about the gate. On a perfectly EFFICIENT
+    #: tape -- linked name already repriced at its true beta, zero exploitable
+    #: edge by construction -- the second-order gate still fires whenever the
+    #: hand-set beta exceeds the true one by 35% or more. The algebra:
+    #:
+    #:     implied  = move * b_hat
+    #:     actual   = move * b_true          (efficient)
+    #:     residual = move * (b_hat - b_true)
+    #:     slack    = |residual| / |implied| = 1 - b_true/b_hat
+    #:
+    #: so slack >= 0.35 reduces to b_true <= 0.65 * b_hat. And an UNDERSTATED
+    #: beta produces a residual of opposite sign and is rejected as "overshot".
+    #: Every signal the gate emits is therefore a case where the beta was too
+    #: high. Without an error bar it is a beta-overstatement detector wearing a
+    #: mispricing costume.
+    #:
+    #: With an error bar the gate can require the residual to exceed what beta
+    #: uncertainty alone could explain, which is the difference between
+    #: measuring a mispricing and measuring your own parameter error.
+    beta_stderr: float | None = None
+
     @property
     def verified(self) -> bool:
         return self.lag_capture is not None
@@ -297,6 +321,7 @@ class LinkageGraph:
                     polarity=polarity, lag_s=link.lag_s, note=link.note,
                     lag_capture=row.get("lag_capture"),
                     dead_rate=row.get("dead_rate"),
+                    beta_stderr=row.get("beta_stderr"),
                 )
                 updated += 1
             bucket.sort(key=lambda x: -x.beta)

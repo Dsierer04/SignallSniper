@@ -92,6 +92,19 @@ class EngineConfig:
     #: names in this graph and are structurally invalid as Apple read-throughs
     #: this week.
     blackout_tickers: frozenset[str] = frozenset()
+    #: Multiples of beta standard error the residual must exceed before it counts
+    #: as a mispricing rather than parameter error. At 2.0 the residual must be
+    #: outside roughly a 95% band around what the beta alone could explain.
+    #:
+    #: Links with an UNKNOWN standard error (beta_stderr is None) cannot pass
+    #: this test at all -- there is no band to be outside of. That is deliberate:
+    #: a hand-set beta with no error bar cannot distinguish a real dislocation
+    #: from its own overstatement, and pretending otherwise is what made the gate
+    #: fire on a perfectly efficient tape.
+    beta_error_sigmas: float = 2.0
+    #: Enforce the above. Off by default only because no link is measured yet;
+    #: it engages automatically once validate.py supplies standard errors.
+    require_beta_error_bar: bool = False
 
     def scale_for(self, ticker: str) -> float:
         if not self.move_scale:
@@ -284,6 +297,19 @@ class SignalEngine:
             slack = abs(residual) / abs(implied)
             if slack < cfg.min_slack_frac:
                 self._reject("already_priced")
+                continue
+
+            # Is this residual bigger than beta error alone could explain?
+            # Uncertainty in beta translates into uncertainty in the implied
+            # move of |primary_move| * stderr. A residual inside that band is
+            # indistinguishable from having guessed the beta wrong.
+            if link.beta_stderr is not None:
+                noise_bps = abs(primary_move) * link.beta_stderr * cfg.beta_error_sigmas
+                if abs(residual) <= noise_bps:
+                    self._reject("within_beta_error")
+                    continue
+            elif cfg.require_beta_error_bar:
+                self._reject("no_beta_error_bar")
                 continue
 
             ok, why = dst_tape.tradeable(cfg.max_spread_bps)
