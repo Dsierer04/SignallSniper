@@ -97,8 +97,14 @@ async def run(args) -> int:
     key = os.getenv("ALPACA_API_KEY", "")
     secret = os.getenv("ALPACA_SECRET_KEY", "")
     if not (key and secret):
-        print("ALPACA_API_KEY / ALPACA_SECRET_KEY required.")
-        print("Run with --selftest to verify the study logic without credentials.")
+        print("ALPACA_API_KEY / ALPACA_SECRET_KEY not set.")
+        print()
+        print("If you have a .env, config.load() reads it -- but this tool reads")
+        print("os.environ directly, so export them or run:")
+        print("  set -a; source .env; set +a")
+        print()
+        print("No keys yet? The study logic runs without any:")
+        print("  python3 tools/validate.py --selftest")
         return 1
 
     primary = args.primary.upper()

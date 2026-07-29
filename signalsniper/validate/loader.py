@@ -108,8 +108,24 @@ class AlpacaBars:
                                  headers=self._headers, params=params)
             if r.status_code == 403:
                 raise RuntimeError(
-                    f"403 loading {symbol} on feed '{self.feed}' -- your data "
-                    "subscription does not cover this feed"
+                    f"403 on {symbol} (feed={self.feed}). Free-tier SIP is a "
+                    "RECENCY gate, not an access gate -- historical bars work if "
+                    "`end` is at least 15 minutes in the past, which it is here. "
+                    "A 403 therefore usually means bad or wrong-environment keys. "
+                    "Check: keys generated while the dashboard said PAPER, and "
+                    "MFA completed (the Trading API is dead until it is)."
+                )
+            if r.status_code == 401:
+                raise RuntimeError(
+                    f"401 on {symbol} -- credentials rejected. Paper keys start "
+                    "with PK. Data lives at data.alpaca.markets for BOTH paper "
+                    "and live, so paper keys are correct here."
+                )
+            if r.status_code == 429:
+                raise RuntimeError(
+                    f"429 on {symbol} -- free tier is 200 requests/min. The "
+                    "loader is sequential and caches to disk, so re-running "
+                    "resumes from the cache rather than re-pulling."
                 )
             r.raise_for_status()
             payload = r.json()
